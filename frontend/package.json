@@ -3,6 +3,11 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "tsc --noEmit && vite build",
+    "test": "vitest run --environment jsdom"
+  },
   "dependencies": {
     "react": "19.3.0",
     "react-dom": "19.3.0",
