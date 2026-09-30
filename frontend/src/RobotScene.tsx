@@ -97,6 +97,26 @@ export default function RobotScene({ project, frame, invalidTime }: RobotScenePr
           world.add(createLink(frame.links[index - 1], point, project.link_radius, armColor));
         }
       });
+
+      const end = frame.links[frame.links.length - 1];
+      const gripper = new THREE.Mesh(
+        new THREE.CircleGeometry(project.gripper_radius, 28),
+        new THREE.MeshBasicMaterial({ color: frame.carried_object_id ? 0x22c55e : 0xfacc15 }),
+      );
+      gripper.position.set(end[0], end[1], 0.03);
+      world.add(gripper);
+
+      if (frame.object_position && frame.carried_object_id) {
+        const carried = project.carried_objects.find((item) => item.id === frame.carried_object_id);
+        if (carried) {
+          const objectMesh = new THREE.Mesh(
+            new THREE.CircleGeometry(carried.radius, 32),
+            new THREE.MeshBasicMaterial({ color: colliding ? 0xef4444 : 0x4ade80 }),
+          );
+          objectMesh.position.set(frame.object_position[0], frame.object_position[1], 0.04);
+          world.add(objectMesh);
+        }
+      }
     }
 
     project.obstacles.forEach((obstacle) => {

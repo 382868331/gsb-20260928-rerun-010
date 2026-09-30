@@ -33,3 +33,5 @@ export const updateProject = (id: string, project: Project) =>
 export const listProjects = () => request<SavedProject[]>("/api/projects");
 
 export const getProject = (id: string) => request<SavedProject>(`/api/projects/${id}`);
+
+export const replayProject = (id: string) => request<ValidationResult>(`/api/projects/${id}/replay`);

@@ -66,3 +66,39 @@ def test_joint_limit_is_checked_along_motion():
 
     assert result["valid"] is False
     assert result["first_collision"]["kind"] == "joint_limit"
+
+
+def test_carried_object_collision_is_checked_after_pick():
+    carried = {"id": "block", "name": "block", "radius": 0.08, "offset_x": 0.18, "offset_y": 0}
+    result = validate_motion(
+        [[0.4, 0, 0], [0.75, 0, 0], [1.0, 0, 0]],
+        [0.5, 0.5, 0.5],
+        JOINT_LIMITS,
+        LINK_LENGTHS,
+        [{"name": "object-path", "x": 2.16, "y": 2.46, "radius": 0.05}],
+        segment_speed_limits=[[0.5, 0.5, 0.5], [0.5, 0.5, 0.5]],
+        carried_objects=[carried],
+        pick_events=[{"waypoint_index": 1, "object_id": "block"}],
+        place_events=[{"waypoint_index": 2, "object_id": "block"}],
+        sample_dt=0.01,
+    )
+
+    assert result["valid"] is False
+    assert result["first_collision"]["kind"] == "carried_object_obstacle"
+    assert result["planned_events"][0] == {"type": "pick", "waypoint_index": 1, "object_id": "block", "time": 0.7}
+
+
+def test_speed_change_at_continuous_segment_boundary_is_checked():
+    result = validate_motion(
+        [[0, 0, 0], [1, 0, 0], [1.05, 0, 0]],
+        [1, 1, 1],
+        JOINT_LIMITS,
+        LINK_LENGTHS,
+        [],
+        segment_speed_limits=[[1, 1, 1], [0.05, 1, 1]],
+        acceleration_limits=[1, 1, 1],
+        velocity_transition_time=0.2,
+    )
+
+    assert result["valid"] is False
+    assert result["first_collision"]["kind"] == "velocity_transition"
