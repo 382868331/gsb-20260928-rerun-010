@@ -12,9 +12,21 @@ class ProjectStore:
         self.directory = directory
         self.directory.mkdir(parents=True, exist_ok=True)
 
-    def save(self, project: Project, project_id: str | None = None) -> SavedProject:
+    def save(self, project: Project, project_id: str | None = None, verdict: dict | None = None) -> SavedProject:
         saved_id = project_id or uuid4().hex
-        saved = SavedProject(id=saved_id, **project.model_dump(exclude={"id"}))
+        data = project.model_dump(exclude={"id"})
+        if verdict is not None:
+            data.update(
+                {
+                    "executable": bool(verdict["valid"]),
+                    "constraint_version": verdict["constraint_version"],
+                    "grasp_events": verdict["grasp_events"],
+                    "release_events": verdict["release_events"],
+                    "segments_solved": verdict["segments_solved"],
+                    "validated_duration": verdict["duration"],
+                }
+            )
+        saved = SavedProject(id=saved_id, **data)
         (self.directory / f"{saved_id}.json").write_text(
             json.dumps(saved.model_dump(), ensure_ascii=False, indent=2),
             encoding="utf-8",

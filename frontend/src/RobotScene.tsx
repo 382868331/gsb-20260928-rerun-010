@@ -107,6 +107,25 @@ export default function RobotScene({ project, frame, invalidTime }: RobotScenePr
       mesh.position.set(obstacle.x, obstacle.y, -0.01);
       world.add(mesh);
     });
+
+    frame?.objects?.forEach((item) => {
+      const held = item.state === "held";
+      if (held) {
+        const box = new THREE.Mesh(
+          new THREE.BoxGeometry(item.radius * 2, item.radius * 2),
+          new THREE.MeshBasicMaterial({ color: 0xa3e635 }),
+        );
+        box.position.set(item.x, item.y, 0.03);
+        world.add(box);
+      } else {
+        const disk = new THREE.Mesh(
+          new THREE.CircleGeometry(item.radius, 4),
+          new THREE.MeshBasicMaterial({ color: 0xc084fc, wireframe: true }),
+        );
+        disk.position.set(item.x, item.y, 0.015);
+        world.add(disk);
+      }
+    });
   }, [frame, invalidTime, project]);
 
   return <div className="scene" ref={mountRef} />;

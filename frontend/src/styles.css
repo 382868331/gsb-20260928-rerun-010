@@ -103,8 +103,11 @@ h2 { margin: 20px 0 10px; font-size: 15px; color: #93a4b8; }
 }
 .obstacle-row {
   display: grid;
-  grid-template-columns: 1.1fr 1fr 1fr 1fr;
+  grid-template-columns: 1fr 1fr 1fr 1fr 34px;
   gap: 7px;
   margin-bottom: 8px;
 }
 select { width: 100%; }
+.seg-ok { color: #4ade80; font-size: 12px; }
+.seg-bad { color: #f87171; font-size: 12px; font-weight: 700; }
+.row:has(.seg-ok), .row:has(.seg-bad) { grid-template-columns: 64px repeat(3, 1fr) 46px; }

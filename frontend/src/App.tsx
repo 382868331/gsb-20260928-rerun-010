@@ -26,6 +26,7 @@ export default function App() {
   const [message, setMessage] = useState<string>("");
   const [savedProjects, setSavedProjects] = useState<SavedProject[]>([]);
   const [currentId, setCurrentId] = useState<string | null>(null);
+  const [savedMeta, setSavedMeta] = useState<{ executable: boolean; constraintVersion: string | null } | null>(null);
   const startedAt = useRef(0);
   const offset = useRef(0);
 
@@ -99,6 +100,10 @@ export default function App() {
       const next = cloneProject(current);
       const last = next.waypoints.at(-1) ?? next.link_lengths.map(() => 0);
       next.waypoints.push([...last]);
+      next.segment_speed_limits = [
+        ...(next.segment_speed_limits ?? []),
+        [...next.speed_limits],
+      ];
       return next;
     });
   };
@@ -108,6 +113,15 @@ export default function App() {
       if (current.waypoints.length <= 2) return current;
       const next = cloneProject(current);
       next.waypoints.splice(index, 1);
+      next.segment_speed_limits = (next.segment_speed_limits ?? []).filter(
+        (_: number[], segmentIndex: number) => segmentIndex !== index,
+      );
+      next.actions = next.actions
+        .filter((action) => action.waypoint_index !== index)
+        .map((action) => ({
+          ...action,
+          waypoint_index: action.waypoint_index > index ? action.waypoint_index - 1 : action.waypoint_index,
+        }));
       return next;
     });
   };
@@ -116,13 +130,19 @@ export default function App() {
     const saved = currentId ? await updateProject(currentId, project) : await saveProject(project);
     setCurrentId(saved.id);
     setSavedProjects(await listProjects());
-    setMessage(`已保存：${saved.name}`);
+    setSavedMeta({ executable: saved.executable, constraintVersion: saved.constraint_version });
+    setMessage(
+      saved.executable
+        ? `已保存：${saved.name}，方案可执行（${saved.constraint_version}）`
+        : `已保存草稿：${saved.name}，仍有无解段，未标记为可执行`,
+    );
   };
 
   const load = async (id: string) => {
     const saved = await getProject(id);
-    const { id: _id, ...nextProject } = saved;
+    const { id: _id, executable, constraint_version, grasp_events, release_events, segments_solved, validated_duration, ...nextProject } = saved;
     setCurrentId(id);
+    setSavedMeta({ executable, constraintVersion: constraint_version });
     setProject(nextProject);
     await validate(nextProject);
   };
@@ -156,6 +176,11 @@ export default function App() {
             )}
             <span>总时长 {result?.duration.toFixed(2) ?? "--"}s</span>
             <span>当前 {frame?.time.toFixed(2) ?? "--"}s</span>
+            {savedMeta && (
+              <span className={savedMeta.executable ? "status ok" : "status bad"}>
+                {savedMeta.executable ? "已标记可执行" : "草稿·不可执行"}
+              </span>
+            )}
           </div>
           <RobotScene project={project} frame={frame} invalidTime={invalidTime} />
           <div className="timeline">
@@ -190,7 +215,33 @@ export default function App() {
           </div>
           <button onClick={addWaypoint}>新增姿态</button>
 
-          <h2>速度上限 rad/s</h2>
+          <h2>各段速度上限 rad/s（衔接处需连续）</h2>
+          <div className="table" role="table">
+            <div className="row head"><span>段</span><span>J1</span><span>J2</span><span>J3</span><span>时长</span></div>
+            {project.waypoints.slice(0, -1).map((_, segmentIndex) => (
+              <div className="row" key={segmentIndex}>
+                <span>P{segmentIndex + 1}→P{segmentIndex + 2}</span>
+                {project.speed_limits.map((_, jointIndex) => (
+                  <NumberInput
+                    key={jointIndex}
+                    value={project.segment_speed_limits?.[segmentIndex]?.[jointIndex] ?? project.speed_limits[jointIndex]}
+                    onChange={(next) => {
+                      const updated = cloneProject(project);
+                      const rows = updated.segment_speed_limits ?? updated.waypoints.slice(0, -1).map(() => [...updated.speed_limits]);
+                      rows[segmentIndex][jointIndex] = next;
+                      updated.segment_speed_limits = rows;
+                      setProject(updated);
+                    }}
+                  />
+                ))}
+                <span className={result?.segments_solved[segmentIndex] ? "seg-ok" : "seg-bad"}>
+                  {result?.segment_durations[segmentIndex]?.toFixed(2) ?? "--"}s
+                </span>
+              </div>
+            ))}
+          </div>
+
+          <h2>全局速度上限 rad/s</h2>
           <div className="grid3">
             {project.speed_limits.map((value, index) => (
               <label key={index}>J{index + 1}
@@ -202,6 +253,96 @@ export default function App() {
               </label>
             ))}
           </div>
+
+          <h2>抓放动作</h2>
+          {project.actions.map((action, index) => (
+            <div className="obstacle-row" key={index}>
+              <select
+                value={action.type}
+                onChange={(event) => {
+                  const updated = cloneProject(project);
+                  updated.actions[index].type = event.target.value as "grasp" | "release";
+                  setProject(updated);
+                }}
+              >
+                <option value="grasp">抓取</option>
+                <option value="release">放下</option>
+              </select>
+              <select
+                value={action.waypoint_index}
+                onChange={(event) => {
+                  const updated = cloneProject(project);
+                  updated.actions[index].waypoint_index = Number(event.target.value);
+                  setProject(updated);
+                }}
+              >
+                {project.waypoints.map((_, pointIndex) => (
+                  <option key={pointIndex} value={pointIndex}>P{pointIndex + 1}</option>
+                ))}
+              </select>
+              <select
+                value={action.object}
+                onChange={(event) => {
+                  const updated = cloneProject(project);
+                  updated.actions[index].object = event.target.value;
+                  setProject(updated);
+                }}
+              >
+                {project.carried_objects.map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}
+              </select>
+              <button className="icon" onClick={() => {
+                const updated = cloneProject(project);
+                updated.actions.splice(index, 1);
+                setProject(updated);
+              }}>×</button>
+            </div>
+          ))}
+          <button onClick={() => {
+            const updated = cloneProject(project);
+            updated.actions.push({
+              type: "grasp",
+              waypoint_index: 0,
+              object: project.carried_objects[0]?.name ?? "",
+            });
+            setProject(updated);
+          }}>新增动作</button>
+
+          <h2>末端携带物体（抓取后用物体外形碰撞）</h2>
+          {project.carried_objects.map((item, index) => (
+            <div className="obstacle-row" key={index}>
+              <input value={item.name} onChange={(event) => {
+                const updated = cloneProject(project);
+                updated.carried_objects[index].name = event.target.value;
+                setProject(updated);
+              }} />
+              <NumberInput value={item.x} onChange={(next) => {
+                const updated = cloneProject(project);
+                updated.carried_objects[index].x = next;
+                setProject(updated);
+              }} />
+              <NumberInput value={item.y} onChange={(next) => {
+                const updated = cloneProject(project);
+                updated.carried_objects[index].y = next;
+                setProject(updated);
+              }} />
+              <NumberInput value={item.radius} step={0.02} onChange={(next) => {
+                const updated = cloneProject(project);
+                updated.carried_objects[index].radius = next;
+                setProject(updated);
+              }} />
+              <button className="icon" onClick={() => {
+                const updated = cloneProject(project);
+                updated.carried_objects.splice(index, 1);
+                updated.actions = updated.actions.filter((action: { object: string }) => action.object !== item.name);
+                setProject(updated);
+              }}>×</button>
+            </div>
+          ))}
+          <button onClick={() => {
+            const updated = cloneProject(project);
+            updated.carried_objects.push({ name: `object-${updated.carried_objects.length + 1}`, x: 1, y: 1, radius: 0.1, hold_dx: 0, hold_dy: 0 });
+            setProject(updated);
+          }}>新增物体</button>
 
           <h2>关节限位 rad</h2>
           {project.joint_limits.map((limit, index) => (

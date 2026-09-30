@@ -33,6 +33,11 @@ def validate_project(project: Project) -> dict:
             [obstacle.model_dump() for obstacle in project.obstacles],
             project.link_radius,
             project.sample_dt,
+            [list(values) for values in project.segment_speed_limits] if project.segment_speed_limits else None,
+            [obj.model_dump() for obj in project.carried_objects],
+            [action.model_dump() for action in project.actions],
+            project.grasp_tolerance,
+            project.junction_speed_tolerance,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -45,12 +50,12 @@ def list_projects() -> list[SavedProject]:
 
 @app.post("/api/projects", response_model=SavedProject)
 def save_project(project: Project) -> SavedProject:
-    return store.save(project)
+    return store.save(project, verdict=validate_project(project))
 
 
 @app.put("/api/projects/{project_id}", response_model=SavedProject)
 def update_project(project_id: str, project: Project) -> SavedProject:
-    return store.save(project, project_id)
+    return store.save(project, project_id, verdict=validate_project(project))
 
 
 @app.get("/api/projects/{project_id}", response_model=SavedProject)
