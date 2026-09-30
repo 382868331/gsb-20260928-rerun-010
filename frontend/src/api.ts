@@ -18,6 +18,12 @@ export const validateProject = (project: Project) =>
     body: JSON.stringify(project),
   });
 
+export const validateProjectSegments = (project: Project, reviewedSegments: number[], previousDigest: string | null) =>
+  request<ValidationResult>("/api/validate-segments", {
+    method: "POST",
+    body: JSON.stringify({ project, reviewed_segments: reviewedSegments, previous_validation_digest: previousDigest }),
+  });
+
 export const saveProject = (project: Project) =>
   request<SavedProject>("/api/projects", {
     method: "POST",

@@ -6,7 +6,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from .robotics import validate_motion
-from .schemas import Project, SavedProject
+from .schemas import Project, SavedProject, ValidationRequest
 from .storage import ProjectStore
 
 app = FastAPI(title="Offline Robot Programming Platform", version="0.1.0")
@@ -29,6 +29,8 @@ def project_validation_kwargs(project: Project) -> dict:
         "pick_events": [item.model_dump() for item in project.pick_events],
         "place_events": [item.model_dump() for item in project.place_events],
         "constraint_version": project.constraint_version,
+        "reviewed_segments": project.reviewed_segments,
+        "previous_validation_digest": project.previous_validation_digest,
     }
 
 
@@ -46,15 +48,23 @@ def run_validation(project: Project) -> dict:
 
 
 def project_digest(project: Project) -> str:
-    payload = project.model_dump()
+    payload = project.model_dump(exclude={"baseline_snapshot"})
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
 def save_validated_project(project: Project, project_id: str | None = None) -> SavedProject:
+    previous = None
+    if project_id:
+        try:
+            previous = store.get(project_id)
+        except FileNotFoundError:
+            previous = None
     validation = None
     error = None
     try:
+        if previous is not None and project.baseline_snapshot is None:
+            project.baseline_snapshot = previous.last_validation
         validation = run_validation(project)
         executable = bool(validation["valid"])
     except ValueError as exc:
@@ -83,6 +93,13 @@ def validate_project(project: Project) -> dict:
         return run_validation(project)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/validate-segments", response_model=dict)
+def validate_project_segments(request: ValidationRequest) -> dict:
+    request.project.reviewed_segments = request.reviewed_segments
+    request.project.previous_validation_digest = request.previous_validation_digest
+    return validate_project(request.project)
 
 
 @app.get("/api/projects", response_model=list[SavedProject])

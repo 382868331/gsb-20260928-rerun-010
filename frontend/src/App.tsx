@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, CheckCircle2, Pause, Play, RotateCcw, Save } from "lucide-react";
-import { getProject, listProjects, saveProject, updateProject, validateProject } from "./api";
+import { AlertTriangle, CheckCircle2, Pause, Play, RotateCcw, Save, ScanSearch } from "lucide-react";
+import { getProject, listProjects, saveProject, updateProject, validateProject, validateProjectSegments } from "./api";
 import { defaultProject } from "./defaults";
 import RobotScene from "./RobotScene";
 import type { CarryEvent, Frame, Project, SavedProject, ValidationResult } from "./types";
@@ -43,17 +43,19 @@ export default function App() {
   const [message, setMessage] = useState<string>("");
   const [savedProjects, setSavedProjects] = useState<SavedProject[]>([]);
   const [currentId, setCurrentId] = useState<string | null>(null);
+  const [replayWindow, setReplayWindow] = useState<{ start: number; end: number } | null>(null);
   const startedAt = useRef(0);
   const offset = useRef(0);
 
   const frame: Frame | null = result?.frames[frameIndex] ?? null;
-  const invalidTime = result?.valid ? null : result?.first_collision?.time ?? null;
+  const invalidTime = result?.valid ? null : replayWindow?.end ?? result?.first_collision?.end_time ?? result?.first_collision?.time ?? null;
 
   const validate = useCallback(async (nextProject = project, shouldPlay = false) => {
     setMessage("");
     try {
       const validation = await validateProject(nextProject);
       setResult(validation);
+      setReplayWindow(null);
       setFrameIndex(0);
       offset.current = 0;
       setPlaying(shouldPlay && validation.frames.length > 1);
@@ -88,19 +90,54 @@ export default function App() {
     };
     animation = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(animation);
-  }, [playing, result, invalidTime]);
+  }, [playing, result, invalidTime, replayWindow]);
 
   const seek = (index: number) => {
     const nextFrame = result?.frames[index];
     setPlaying(false);
+    setReplayWindow(null);
     setFrameIndex(index);
     offset.current = nextFrame?.time ?? 0;
   };
 
   const replay = () => {
+    const start = replayWindow?.start ?? 0;
+    offset.current = start;
+    const nextIndex = result?.frames.findIndex((frame) => frame.time >= start) ?? 0;
+    setFrameIndex(nextIndex === -1 ? 0 : nextIndex);
+    setPlaying(true);
+  };
+
+  const replayNearFirstHazard = () => {
+    const window = result?.replay_window;
+    if (!window || !result) return;
+    const nextWindow = { start: window.start_time, end: window.end_time };
+    setReplayWindow(nextWindow);
+    offset.current = nextWindow.start;
+    const nextIndex = result.frames.findIndex((frame) => frame.time >= nextWindow.start);
+    setFrameIndex(nextIndex === -1 ? 0 : nextIndex);
+    setPlaying(true);
+  };
+
+  const replayFullMotion = () => {
+    setReplayWindow(null);
     offset.current = 0;
     setFrameIndex(0);
     setPlaying(true);
+  };
+
+  const recheckChangedSegments = async () => {
+    if (!result) return;
+    const digest = `${JSON.stringify(project.waypoints)}:${JSON.stringify(project.segment_speed_limits)}`;
+    const validation = await validateProjectSegments(
+      { ...project, previous_validation_digest: digest },
+      Array.from({ length: Math.max(0, project.waypoints.length - 1) }, (_, index) => index),
+      digest,
+    );
+    setResult(validation);
+    setReplayWindow(null);
+    setFrameIndex(0);
+    setMessage(validation.review.stale_segments.length ? "局部复核发现旧结论已失效" : "已按当前约束重新检查指定区间");
   };
 
   const updateWaypoint = (pointIndex: number, jointIndex: number, value: number) => {
@@ -180,10 +217,26 @@ export default function App() {
             <span>总时长 {result?.duration.toFixed(2) ?? "--"}s</span>
             <span>约束 {result?.constraint_version ?? project.constraint_version}</span>
             <span>当前 {frame?.time.toFixed(2) ?? "--"}s</span>
+            <span>安全检查步长 {result?.collision_check_dt.toFixed(3) ?? "--"}s / 显示 {project.sample_dt}s</span>
           </div>
-          <RobotScene project={project} frame={frame} invalidTime={invalidTime} />
+          {result && !result.valid && result.replay_window && (
+            <div className="message warning">
+              <AlertTriangle size={15} />
+              首次危险区间：S{result.replay_window.segment + 1}，{result.replay_window.start_time.toFixed(3)}s–{result.replay_window.end_time.toFixed(3)}s；该区间为保守包络结论，不能按采样点安全处理。
+              <button onClick={replayNearFirstHazard}><ScanSearch size={15} />只重放附近</button>
+              <button onClick={replayFullMotion}>全程重放</button>
+            </div>
+          )}
+          {result && (
+            <div className="message">
+              已复核段：{result.review.reviewed_segments.length ? result.review.reviewed_segments.map((item) => `S${item + 1}`).join("、") : "全部轨迹"}
+              {result.review.stale_segments.length ? `；失效段：${result.review.stale_segments.map((item) => `S${item + 1}`).join("、")}` : "；旧危险结论已由当前结果替代"}
+              <button onClick={recheckChangedSegments}><RotateCcw size={15} />复核局部轨迹</button>
+            </div>
+          )}
+          <RobotScene project={project} frame={frame} invalidTime={invalidTime} hazardWindow={result?.first_collision ? { start_time: result.first_collision.time, end_time: result.first_collision.end_time ?? result.first_collision.time } : null} />
           <div className="timeline">
-            <button onClick={() => (playing ? setPlaying(false) : replay())}>
+            <button onClick={() => (playing ? setPlaying(false) : replayWindow ? replay() : replayFullMotion())}>
               {playing ? <Pause size={16} /> : <Play size={16} />}{playing ? "暂停" : "重放"}
             </button>
             <input

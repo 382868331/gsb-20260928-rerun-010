@@ -11,6 +11,21 @@ class Collision:
     segment: int
     kind: str
     message: str
+    end_time: float | None = None
+    confidence: str = "interval"
+
+
+@dataclass(frozen=True)
+class HazardInterval:
+    start_time: float
+    end_time: float
+    segment: int
+    kind: str
+    message: str
+    confidence: str
+
+
+COLLISION_CHECK_DT = 0.005
 
 
 def _as_vector(values: list[float], name: str, size: int) -> np.ndarray:
@@ -72,15 +87,18 @@ def interpolate_trajectory(
             continue
         start = points[segment]
         end = points[segment + 1]
-        count = max(1, int(np.ceil(duration / sample_dt)))
+        count = max(1, int(np.floor(duration / sample_dt + 1e-9)))
         for index in range(1, count + 1):
-            local_time = min(duration, index * sample_dt)
+            local_time = index * sample_dt
             current_time = elapsed + local_time
             if abs(current_time - times[-1]) <= 1e-9:
                 continue
             alpha = local_time / duration
             times.append(current_time)
             samples.append(start + alpha * (end - start))
+        if times[-1] < elapsed + duration - 1e-9:
+            times.append(elapsed + duration)
+            samples.append(end.copy())
         elapsed += duration
 
     return times, samples, durations
@@ -141,6 +159,33 @@ def capsule_distance(
     )
 
 
+def swept_segment_envelope_distance(start_a, end_a, start_b, end_b):
+    return min(
+        point_segment_distance(*start_a, *start_b, *end_b),
+        point_segment_distance(*end_a, *start_b, *end_b),
+        point_segment_distance(*start_b, *start_a, *end_a),
+        point_segment_distance(*end_b, *start_a, *end_a),
+    )
+
+
+def carried_object_pose(vertices, angles, carried_object):
+    end_x, end_y = vertices[-1]
+    end_orientation = float(np.sum(angles))
+    offset_x = float(carried_object.get("offset_x", carried_object.get("offset", [0.0, 0.0])[0]))
+    offset_y = float(carried_object.get("offset_y", carried_object.get("offset", [0.0, 0.0])[1]))
+    rotated_x = offset_x * cos(end_orientation) - offset_y * sin(end_orientation)
+    rotated_y = offset_x * sin(end_orientation) + offset_y * cos(end_orientation)
+    return end_x + rotated_x, end_y + rotated_y
+
+
+def active_object_for_segment(picks_by_waypoint, places_by_waypoint, segment_index):
+    active = set()
+    for index in range(segment_index + 1):
+        active.update(picks_by_waypoint.get(index, []))
+        active.difference_update(places_by_waypoint.get(index + 1, []))
+    return next(iter(active), None) if active else None
+
+
 def validate_motion(
     waypoints: list[list[float]],
     speed_limits: list[float],
@@ -157,6 +202,8 @@ def validate_motion(
     pick_events: list[dict] | None = None,
     place_events: list[dict] | None = None,
     constraint_version: str = "1.1",
+    reviewed_segments: list[int] | None = None,
+    previous_validation_digest: str | None = None,
 ) -> dict:
     dof = len(link_lengths)
     limits = _as_vector(speed_limits, "speed_limits", dof)
@@ -200,10 +247,17 @@ def validate_motion(
         if key in place_keys:
             raise ValueError("duplicate place event")
         place_keys.add(key)
+
     active_objects: set[str] = set()
+    picks_by_waypoint: dict[int, list[str]] = {}
+    places_by_waypoint: dict[int, list[str]] = {}
+    for event in pick_events:
+        picks_by_waypoint.setdefault(int(event["waypoint_index"]), []).append(str(event["object_id"]))
+    for event in place_events:
+        places_by_waypoint.setdefault(int(event["waypoint_index"]), []).append(str(event["object_id"]))
     for index in range(len(waypoints)):
-        current_picks = {str(event["object_id"]) for event in pick_events if int(event["waypoint_index"]) == index}
-        current_places = {str(event["object_id"]) for event in place_events if int(event["waypoint_index"]) == index}
+        current_picks = set(picks_by_waypoint.get(index, []))
+        current_places = set(places_by_waypoint.get(index, []))
         if current_picks & active_objects:
             raise ValueError("object cannot be picked while it is already carried")
         if current_places - active_objects:
@@ -213,34 +267,32 @@ def validate_motion(
         if len(active_objects) > 1:
             raise ValueError("only one object may be carried at a time")
 
-    times, samples, segment_durations = interpolate_trajectory(
+    display_times, display_samples, segment_durations = interpolate_trajectory(
         waypoints, speed_limits, sample_dt, segment_speed_limits
+    )
+    check_times, check_samples, _ = interpolate_trajectory(
+        waypoints, speed_limits, COLLISION_CHECK_DT, segment_speed_limits
     )
     points = [np.asarray(values, dtype=float) for values in waypoints]
     velocities = segment_velocities(points, segment_durations)
     boundaries = np.cumsum([0.0, *segment_durations[:-1]])
-    collisions: list[Collision] = []
-    frames: list[dict] = []
+    hazards: list[HazardInterval] = []
 
     for segment_index in range(len(velocities) - 1):
         velocity_change = np.abs(velocities[segment_index + 1] - velocities[segment_index])
         allowed_change = acceleration * velocity_transition_time
         for joint in np.where(velocity_change > allowed_change + 1e-9)[0]:
-            collisions.append(
-                Collision(
+            hazards.append(
+                HazardInterval(
+                    float(boundaries[segment_index + 1]),
                     float(boundaries[segment_index + 1]),
                     segment_index + 1,
                     "velocity_transition",
                     f"joint {int(joint) + 1} changes speed too quickly between segments {segment_index + 1} and {segment_index + 2}",
+                    "boundary",
                 )
             )
 
-    picks_by_waypoint: dict[int, list[str]] = {}
-    places_by_waypoint: dict[int, list[str]] = {}
-    for event in pick_events:
-        picks_by_waypoint.setdefault(int(event["waypoint_index"]), []).append(str(event["object_id"]))
-    for event in place_events:
-        places_by_waypoint.setdefault(int(event["waypoint_index"]), []).append(str(event["object_id"]))
     planned_events: list[dict] = []
     elapsed = 0.0
     for index in range(len(points)):
@@ -251,70 +303,128 @@ def validate_motion(
         if index < len(segment_durations):
             elapsed += segment_durations[index]
 
-    def active_object_at(segment: int, time: float) -> str | None:
-        active: set[str] = set()
-        boundary_time = 0.0
-        for index, duration in enumerate(segment_durations):
-            for object_id in picks_by_waypoint.get(index, []):
-                active.add(object_id)
-            boundary_time += duration
-            for object_id in places_by_waypoint.get(index + 1, []):
-                if index < segment or time >= boundary_time - 1e-9:
-                    active.discard(object_id)
-            if index == segment:
-                break
-        if len(active) > 1:
-            raise ValueError("only one object may be carried at a time")
-        return next(iter(active), None)
+    def add_hazard(start_time: float, end_time: float, segment: int, kind: str, message: str, confidence: str = "interval") -> None:
+        hazards.append(HazardInterval(start_time, end_time, segment, kind, message, confidence))
 
-    for time, angles in zip(times, samples):
+    for interval_index in range(len(check_samples) - 1):
+        start_time = float(check_times[interval_index])
+        end_time = float(check_times[interval_index + 1])
+        start_angles = check_samples[interval_index]
+        end_angles = check_samples[interval_index + 1]
+        segment = int(np.searchsorted(boundaries, start_time, side="right") - 1)
+        segment = min(segment, max(0, len(segment_durations) - 1))
+        envelope_vertices = [
+            forward_kinematics(start_angles + (step / 32) * (end_angles - start_angles), link_lengths)
+            for step in range(33)
+        ]
+        start_vertices = envelope_vertices[0]
+        end_vertices = envelope_vertices[-1]
+        active_object_id = active_object_for_segment(picks_by_waypoint, {}, segment)
+
+        for joint in range(dof):
+            low = min(float(start_angles[joint]), float(end_angles[joint]))
+            high = max(float(start_angles[joint]), float(end_angles[joint]))
+            if high < float(bounds[joint, 0]) or low > float(bounds[joint, 1]):
+                add_hazard(start_time, end_time, segment, "joint_limit", f"joint {joint + 1} exceeded its limit")
+                break
+        if hazards and hazards[-1].start_time == start_time:
+            continue
+
+        hit = False
+        for obstacle in obstacles:
+            ox, oy, obstacle_radius = float(obstacle["x"]), float(obstacle["y"]), float(obstacle["radius"])
+            name = obstacle.get("name", "obstacle")
+            for link_index in range(len(start_vertices) - 1):
+                distance = min(
+                    min(
+                        point_segment_distance(ox, oy, *vertices[link_index], *vertices[link_index + 1])
+                        for vertices in envelope_vertices
+                    ),
+                    min(
+                        swept_segment_envelope_distance(
+                            first[link_index + 1], second[link_index + 1], (ox, oy), (ox, oy)
+                        )
+                        for first, second in zip(envelope_vertices, envelope_vertices[1:])
+                    ),
+                    min(
+                        swept_segment_envelope_distance(
+                            first[link_index], second[link_index], (ox, oy), (ox, oy)
+                        )
+                        for first, second in zip(envelope_vertices, envelope_vertices[1:])
+                    ),
+                )
+                if distance < obstacle_radius + link_radius:
+                    add_hazard(start_time, end_time, segment, "obstacle", f"link {link_index + 1} swept through obstacle {name}")
+                    hit = True
+                    break
+            if hit:
+                break
+            gripper_distance = min(
+                swept_segment_envelope_distance(first[-1], second[-1], (ox, oy), (ox, oy))
+                for first, second in zip(envelope_vertices, envelope_vertices[1:])
+            )
+            if gripper_distance < obstacle_radius + gripper_radius:
+                add_hazard(start_time, end_time, segment, "gripper_obstacle", f"gripper swept through obstacle {name}")
+                hit = True
+                break
+        if hit:
+            continue
+
+        if active_object_id is not None:
+            active_object = objects_by_id[active_object_id]
+            envelope_angles = [start_angles + (step / 32) * (end_angles - start_angles) for step in range(33)]
+            envelope_poses = [
+                carried_object_pose(vertices, angles, active_object)
+                for vertices, angles in zip(envelope_vertices, envelope_angles)
+            ]
+            object_radius = float(active_object["radius"])
+            for obstacle in obstacles:
+                ox, oy, obstacle_radius = float(obstacle["x"]), float(obstacle["y"]), float(obstacle["radius"])
+                distance = min(
+                    swept_segment_envelope_distance(first, second, (ox, oy), (ox, oy))
+                    for first, second in zip(envelope_poses, envelope_poses[1:])
+                )
+                if distance < obstacle_radius + object_radius:
+                    name = obstacle.get("name", "obstacle")
+                    add_hazard(start_time, end_time, segment, "carried_object_obstacle", f"carried object {active_object_id} swept through obstacle {name}")
+                    hit = True
+                    break
+        if hit:
+            continue
+
+        for left in range(len(start_vertices) - 1):
+            for right in range(left + 2, len(start_vertices) - 1):
+                distance = min(
+                    capsule_distance(vertices[left], vertices[left + 1], vertices[right], vertices[right + 1])
+                    for vertices in envelope_vertices
+                )
+                for first, second in zip(envelope_vertices, envelope_vertices[1:]):
+                    for left_point in (left, left + 1):
+                        for right_point in (right, right + 1):
+                            distance = min(
+                                distance,
+                                swept_segment_envelope_distance(
+                                    first[left_point], second[left_point], first[right_point], second[right_point]
+                                ),
+                            )
+                if distance < link_radius * 2:
+                    add_hazard(start_time, end_time, segment, "self_collision", f"links {left + 1} and {right + 1} collided")
+                    hit = True
+                    break
+            if hit:
+                break
+
+    hazards.sort(key=lambda item: (item.start_time, item.end_time, item.kind))
+
+    frames: list[dict] = []
+    for time, angles in zip(display_times, display_samples):
         segment = int(np.searchsorted(boundaries, time, side="right") - 1)
         segment = min(segment, max(0, len(segment_durations) - 1))
-
-        for joint in np.where((angles < bounds[:, 0]) | (angles > bounds[:, 1]))[0]:
-            collisions.append(Collision(float(time), segment, "joint_limit", f"joint {int(joint) + 1} exceeded its limit"))
-
         vertices = forward_kinematics(angles, link_lengths)
-        active_object_id = active_object_at(segment, float(time))
-        active_object = objects_by_id[active_object_id] if active_object_id is not None else None
-        end_x, end_y = vertices[-1]
-        end_orientation = float(np.sum(angles))
-        object_position: tuple[float, float] | None = None
-        for obstacle in obstacles:
-            ox, oy, radius = float(obstacle["x"]), float(obstacle["y"]), float(obstacle["radius"])
-            for link_index in range(len(vertices) - 1):
-                distance = point_segment_distance(ox, oy, *vertices[link_index], *vertices[link_index + 1])
-                if distance < radius + link_radius:
-                    name = obstacle.get("name", f"obstacle-{link_index + 1}")
-                    collisions.append(Collision(float(time), segment, "obstacle", f"link {link_index + 1} collided with obstacle {name}"))
-
-            end_distance = sqrt((ox - end_x) ** 2 + (oy - end_y) ** 2)
-            if end_distance < radius + gripper_radius:
-                name = obstacle.get("name", "obstacle")
-                collisions.append(Collision(float(time), segment, "gripper_obstacle", f"gripper collided with obstacle {name}"))
-
-        if active_object is not None:
-            offset_x = float(active_object.get("offset_x", active_object.get("offset", [0.0, 0.0])[0]))
-            offset_y = float(active_object.get("offset_y", active_object.get("offset", [0.0, 0.0])[1]))
-            object_radius = float(active_object["radius"])
-            rotated_x = offset_x * cos(end_orientation) - offset_y * sin(end_orientation)
-            rotated_y = offset_x * sin(end_orientation) + offset_y * cos(end_orientation)
-            object_position = (end_x + rotated_x, end_y + rotated_y)
-            for obstacle in obstacles:
-                ox, oy, radius = float(obstacle["x"]), float(obstacle["y"]), float(obstacle["radius"])
-                distance = sqrt((ox - object_position[0]) ** 2 + (oy - object_position[1]) ** 2)
-                if distance < radius + object_radius:
-                    name = obstacle.get("name", "obstacle")
-                    collisions.append(
-                        Collision(float(time), segment, "carried_object_obstacle", f"carried object {active_object_id} collided with obstacle {name}")
-                    )
-
-        for left in range(len(vertices) - 1):
-            for right in range(left + 2, len(vertices) - 1):
-                distance = capsule_distance(vertices[left], vertices[left + 1], vertices[right], vertices[right + 1])
-                if distance < link_radius * 2:
-                    collisions.append(Collision(float(time), segment, "self_collision", f"links {left + 1} and {right + 1} collided"))
-
+        active_object_id = active_object_for_segment(picks_by_waypoint, places_by_waypoint, segment)
+        object_position = None
+        if active_object_id is not None:
+            object_position = carried_object_pose(vertices, angles, objects_by_id[active_object_id])
         frames.append(
             {
                 "time": float(time),
@@ -325,14 +435,42 @@ def validate_motion(
             }
         )
 
-    first = collisions[0] if collisions else None
+    first_hazard = hazards[0] if hazards else None
+    first = None if first_hazard is None else Collision(
+        first_hazard.start_time,
+        first_hazard.segment,
+        first_hazard.kind,
+        first_hazard.message,
+        first_hazard.end_time,
+        first_hazard.confidence,
+    )
+    reviewed = sorted({int(value) for value in (reviewed_segments or []) if 0 <= int(value) < len(segment_durations)})
+    affected_segments = sorted({item.segment for item in hazards})
     return {
-        "valid": not collisions,
-        "duration": float(times[-1]),
+        "valid": not hazards,
+        "duration": float(display_times[-1]),
         "segment_durations": [float(value) for value in segment_durations],
         "frames": frames,
         "planned_events": planned_events,
         "constraint_version": constraint_version,
-        "collisions": [collision.__dict__ for collision in collisions[:20]],
+        "collision_check_dt": COLLISION_CHECK_DT,
+        "display_sample_dt": float(sample_dt),
+        "collisions": [
+            Collision(item.start_time, item.segment, item.kind, item.message, item.end_time, item.confidence).__dict__
+            for item in hazards[:20]
+        ],
+        "hazard_intervals": [item.__dict__ for item in hazards],
+        "replay_window": None if first_hazard is None else {
+            "start_time": max(0.0, first_hazard.start_time - max(COLLISION_CHECK_DT, sample_dt)),
+            "end_time": min(float(display_times[-1]), first_hazard.end_time + max(COLLISION_CHECK_DT, sample_dt)),
+            "segment": first_hazard.segment,
+        },
+        "review": {
+            "previous_validation_digest": previous_validation_digest,
+            "reviewed_segments": reviewed,
+            "affected_segments": affected_segments,
+            "stale_segments": [segment for segment in reviewed if segment in affected_segments],
+            "fully_rechecked": not reviewed or not affected_segments,
+        },
         "first_collision": None if first is None else first.__dict__,
     }

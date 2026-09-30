@@ -35,6 +35,9 @@ export type Project = {
   constraint_version: string;
   link_radius: number;
   sample_dt: number;
+  reviewed_segments: number[];
+  previous_validation_digest: string | null;
+  baseline_snapshot: ValidationResult | null;
 };
 
 export type PlannedEvent = {
@@ -49,6 +52,17 @@ export type Collision = {
   segment: number;
   kind: string;
   message: string;
+  end_time?: number;
+  confidence?: string;
+};
+
+export type HazardInterval = Collision & {
+  start_time: number;
+  end_time: number;
+  segment: number;
+  kind: string;
+  message: string;
+  confidence: string;
 };
 
 export type Frame = {
@@ -68,6 +82,17 @@ export type ValidationResult = {
   constraint_version: string;
   collisions: Collision[];
   first_collision: Collision | null;
+  collision_check_dt: number;
+  display_sample_dt: number;
+  hazard_intervals: HazardInterval[];
+  replay_window: { start_time: number; end_time: number; segment: number } | null;
+  review: {
+    previous_validation_digest: string | null;
+    reviewed_segments: number[];
+    affected_segments: number[];
+    stale_segments: number[];
+    fully_rechecked: boolean;
+  };
 };
 
 export type SavedProject = Project & {

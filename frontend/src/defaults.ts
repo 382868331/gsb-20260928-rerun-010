@@ -30,4 +30,7 @@ export const defaultProject: Project = {
   constraint_version: "1.1",
   link_radius: 0.08,
   sample_dt: 0.02,
+  reviewed_segments: [],
+  previous_validation_digest: null,
+  baseline_snapshot: null,
 };

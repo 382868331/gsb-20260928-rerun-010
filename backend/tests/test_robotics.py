@@ -47,6 +47,35 @@ def test_intermediate_obstacle_collision_is_rejected_while_endpoints_are_safe():
     assert end_result["valid"] is True
 
 
+def test_display_step_size_does_not_change_swept_collision_conclusion():
+    fine = validate_motion(
+        WAYPOINTS,
+        [0.8, 0.8, 0.8],
+        JOINT_LIMITS,
+        LINK_LENGTHS,
+        [OBSTACLE],
+        link_radius=0.08,
+        sample_dt=0.01,
+    )
+    coarse = validate_motion(
+        WAYPOINTS,
+        [0.8, 0.8, 0.8],
+        JOINT_LIMITS,
+        LINK_LENGTHS,
+        [OBSTACLE],
+        link_radius=0.08,
+        sample_dt=2.0,
+    )
+
+    assert fine["valid"] is False
+    assert coarse["valid"] is False
+    assert coarse["first_collision"]["kind"] == fine["first_collision"]["kind"]
+    assert coarse["replay_window"]["start_time"] < coarse["first_collision"]["time"]
+    assert coarse["replay_window"]["end_time"] > coarse["first_collision"]["end_time"]
+    assert coarse["display_sample_dt"] == 2.0
+    assert coarse["collision_check_dt"] <= 0.01
+
+
 def test_speed_limit_changes_motion_time():
     fast_times, _, _ = interpolate_trajectory(WAYPOINTS, [1.0, 1.0, 1.0], sample_dt=0.01)
     slow_times, _, _ = interpolate_trajectory(WAYPOINTS, [0.5, 1.0, 1.0], sample_dt=0.01)

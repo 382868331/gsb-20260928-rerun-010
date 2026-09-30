@@ -6,6 +6,7 @@ type RobotSceneProps = {
   project: Project;
   frame: Frame | null;
   invalidTime: number | null;
+  hazardWindow?: { start_time: number; end_time: number } | null;
 };
 
 const materialCache = new Map<string, THREE.MeshBasicMaterial>();
@@ -30,7 +31,7 @@ function createLink(a: [number, number], b: [number, number], radius: number, co
   return mesh;
 }
 
-export default function RobotScene({ project, frame, invalidTime }: RobotSceneProps) {
+export default function RobotScene({ project, frame, invalidTime, hazardWindow }: RobotSceneProps) {
   const mountRef = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
   const worldRef = useRef<THREE.Group | null>(null);
@@ -85,7 +86,7 @@ export default function RobotScene({ project, frame, invalidTime }: RobotScenePr
     if (!world) return;
     world.clear();
     const afterCollision = invalidTime !== null && frame !== null && frame.time > invalidTime;
-    const colliding = invalidTime !== null && frame !== null && Math.abs(frame.time - invalidTime) < project.sample_dt;
+    const colliding = hazardWindow != null && frame !== null && frame.time >= hazardWindow.start_time && frame.time <= hazardWindow.end_time;
     const armColor = afterCollision ? 0x6b7280 : colliding ? 0xef4444 : 0x38bdf8;
 
     if (frame) {
@@ -127,7 +128,7 @@ export default function RobotScene({ project, frame, invalidTime }: RobotScenePr
       mesh.position.set(obstacle.x, obstacle.y, -0.01);
       world.add(mesh);
     });
-  }, [frame, invalidTime, project]);
+  }, [frame, invalidTime, hazardWindow, project]);
 
   return <div className="scene" ref={mountRef} />;
 }

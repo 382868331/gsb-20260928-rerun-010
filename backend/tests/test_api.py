@@ -22,6 +22,16 @@ def test_validate_route_rejects_mid_path_collision():
     assert data["first_collision"]["kind"] == "obstacle"
 
 
+def test_validate_route_display_step_does_not_control_safety():
+    payload = project_payload()
+    payload["sample_dt"] = 2.0
+    data = validate_project(Project.model_validate(payload))
+    assert data["valid"] is False
+    assert data["display_sample_dt"] == 2.0
+    assert data["collision_check_dt"] != 2.0
+    assert data["replay_window"]["start_time"] < data["first_collision"]["time"]
+
+
 def test_saved_project_keeps_incomplete_editor_data_but_is_not_executable(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "store", main.ProjectStore(tmp_path))
     invalid = Project.model_validate(project_payload())

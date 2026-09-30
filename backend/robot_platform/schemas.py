@@ -38,6 +38,9 @@ class Project(BaseModel):
     constraint_version: str = "1.1"
     link_radius: float = 0.08
     sample_dt: float = Field(default=0.02, gt=0)
+    reviewed_segments: list[int] = []
+    previous_validation_digest: str | None = None
+    baseline_snapshot: dict | None = None
 
 
 class SavedProject(Project):
@@ -47,3 +50,9 @@ class SavedProject(Project):
     validation_digest: str = ""
     last_validation: dict | None = None
     validation_error: str | None = None
+
+
+class ValidationRequest(BaseModel):
+    project: Project
+    reviewed_segments: list[int] = []
+    previous_validation_digest: str | None = None
