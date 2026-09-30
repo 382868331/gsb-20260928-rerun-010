@@ -27,7 +27,8 @@ export const defaultProject: Project = {
   pick_events: [{ waypoint_index: 1, object_id: "block-a" }],
   place_events: [{ waypoint_index: 3, object_id: "block-a" }],
   gripper_radius: 0.06,
-  constraint_version: "1.1",
+  constraint_version: "2.0",
   link_radius: 0.08,
-  sample_dt: 0.02,
+  sample_dt: 0.08,
+  safety_resolution: 0.005,
 };

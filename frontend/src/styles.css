@@ -108,3 +108,35 @@ h2 { margin: 20px 0 10px; font-size: 15px; color: #93a4b8; }
   margin-bottom: 8px;
 }
 select { width: 100%; }
+.danger-panel {
+  border: 1px solid rgba(239, 68, 68, 0.45);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: rgba(239, 68, 68, 0.08);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.danger-panel h3 { margin: 0 0 2px; font-size: 13px; color: #fca5a5; }
+.danger-row {
+  display: grid;
+  grid-template-columns: 1.5fr 1fr auto;
+  gap: 8px;
+  align-items: center;
+  font-size: 12px;
+  color: #e2e8f0;
+}
+.danger-row button { padding: 4px 9px; font-size: 12px; }
+.revision {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 12px;
+  color: #cbd5e1;
+  border: 1px solid #2b3546;
+  border-radius: 8px;
+  padding: 8px;
+  margin-bottom: 8px;
+}
+.revision button { align-self: flex-start; padding: 4px 9px; font-size: 12px; }
+.hint { color: #8190a3; font-size: 12px; line-height: 1.5; }

@@ -1,11 +1,12 @@
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
-import type { Frame, Project } from "./types";
+import type { DangerInterval, Frame, Project } from "./types";
 
 type RobotSceneProps = {
   project: Project;
   frame: Frame | null;
   invalidTime: number | null;
+  dangerIntervals: DangerInterval[];
 };
 
 const materialCache = new Map<string, THREE.MeshBasicMaterial>();
@@ -30,7 +31,7 @@ function createLink(a: [number, number], b: [number, number], radius: number, co
   return mesh;
 }
 
-export default function RobotScene({ project, frame, invalidTime }: RobotSceneProps) {
+export default function RobotScene({ project, frame, invalidTime, dangerIntervals }: RobotSceneProps) {
   const mountRef = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
   const worldRef = useRef<THREE.Group | null>(null);
@@ -84,9 +85,14 @@ export default function RobotScene({ project, frame, invalidTime }: RobotScenePr
     const world = worldRef.current;
     if (!world) return;
     world.clear();
+    const currentDanger = frame !== null
+      ? dangerIntervals.find(
+          (interval) => frame.time >= interval.start_time - 1e-9 && frame.time <= interval.end_time + 1e-9,
+        )
+      : undefined;
     const afterCollision = invalidTime !== null && frame !== null && frame.time > invalidTime;
-    const colliding = invalidTime !== null && frame !== null && Math.abs(frame.time - invalidTime) < project.sample_dt;
-    const armColor = afterCollision ? 0x6b7280 : colliding ? 0xef4444 : 0x38bdf8;
+    const armColor = afterCollision ? 0x6b7280 : currentDanger ? 0xef4444 : 0x38bdf8;
+    const colliding = Boolean(currentDanger);
 
     if (frame) {
       frame.links.forEach((point, index) => {
@@ -127,7 +133,7 @@ export default function RobotScene({ project, frame, invalidTime }: RobotScenePr
       mesh.position.set(obstacle.x, obstacle.y, -0.01);
       world.add(mesh);
     });
-  }, [frame, invalidTime, project]);
+  }, [frame, invalidTime, project, dangerIntervals]);
 
   return <div className="scene" ref={mountRef} />;
 }

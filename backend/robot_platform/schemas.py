@@ -35,9 +35,10 @@ class Project(BaseModel):
     acceleration_limits: list[float] | None = None
     velocity_transition_time: float = Field(default=0.2, gt=0)
     gripper_radius: float = Field(default=0.06, gt=0)
-    constraint_version: str = "1.1"
+    constraint_version: str = "2.0"
     link_radius: float = 0.08
-    sample_dt: float = Field(default=0.02, gt=0)
+    sample_dt: float = Field(default=0.05, gt=0, description="display/replay frame step; never affects the safety verdict")
+    safety_resolution: float = Field(default=0.005, gt=0, description="time resolution of the conservative swept-volume certification")
 
 
 class SavedProject(Project):
@@ -47,3 +48,16 @@ class SavedProject(Project):
     validation_digest: str = ""
     last_validation: dict | None = None
     validation_error: str | None = None
+    revisions: list[dict] = []
+
+
+class RecheckRequest(BaseModel):
+    segments: list[int]
+    safety_resolution: float | None = Field(default=None, gt=0)
+
+
+class RecheckResult(BaseModel):
+    checked_segments: list[int]
+    invalidated_segments: list[int]
+    validation: dict
+    revision: dict

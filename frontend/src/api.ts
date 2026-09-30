@@ -35,3 +35,9 @@ export const listProjects = () => request<SavedProject[]>("/api/projects");
 export const getProject = (id: string) => request<SavedProject>(`/api/projects/${id}`);
 
 export const replayProject = (id: string) => request<ValidationResult>(`/api/projects/${id}/replay`);
+
+export const recheckProject = (id: string, segments: number[]) =>
+  request<import("./types").RecheckResponse>(`/api/projects/${id}/recheck`, {
+    method: "POST",
+    body: JSON.stringify({ segments }),
+  });
