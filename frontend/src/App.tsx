@@ -3,7 +3,7 @@ import { AlertTriangle, CheckCircle2, Pause, Play, RotateCcw, Save, ScanSearch }
 import { getProject, listProjects, saveProject, updateProject, validateProject, validateProjectSegments } from "./api";
 import { defaultProject } from "./defaults";
 import RobotScene from "./RobotScene";
-import type { CarryEvent, Frame, Project, SavedProject, ValidationResult } from "./types";
+import type { AbnormalValidationResult, CarryEvent, Frame, Project, SavedProject, ValidationResult } from "./types";
 
 const cloneProject = (project: Project): Project => JSON.parse(JSON.stringify(project));
 
@@ -126,6 +126,15 @@ export default function App() {
     setPlaying(true);
   };
 
+  const replayAbnormalScenario = (scenario: AbnormalValidationResult) => {
+    setResult(scenario);
+    setReplayWindow(null);
+    setFrameIndex(0);
+    offset.current = 0;
+    setPlaying(true);
+    setMessage(`正在重放异常后续方案：${scenario.scenario?.name ?? scenario.scenario?.kind}`);
+  };
+
   const recheckChangedSegments = async () => {
     if (!result) return;
     const digest = `${JSON.stringify(project.waypoints)}:${JSON.stringify(project.segment_speed_limits)}`;
@@ -234,6 +243,28 @@ export default function App() {
               <button onClick={recheckChangedSegments}><RotateCcw size={15} />复核局部轨迹</button>
             </div>
           )}
+          {result?.task_review && (
+            <div className="message warning">
+              <strong>完整任务核对：</strong>
+              {result.task_review.revalidation_required_segments.length
+                ? `需要重新核对 ${result.task_review.revalidation_required_segments.map((item) => `S${item + 1}`).join("、")}`
+                : "所有后续区间均采用当前版本与交接条件核对"}
+              {result.first_collision && `；首次${result.first_collision.confidence === "unknown" ? "未知" : "危险"}区间 ${result.first_collision.time.toFixed(3)}s（S${result.first_collision.segment + 1}）`}
+              {`；交接：${result.task_review.handoff_conditions.map((item) => `${item.id}/${item.gripper_state}/${item.confidence === "unknown" ? "未知" : "确认"}`).join("、") || "无"}`}
+            </div>
+          )}
+          {result?.abnormal_scenarios?.map((scenario) => (
+            <div className="message warning" key={scenario.scenario?.id ?? scenario.scenario?.kind}>
+              <strong>异常后续：{scenario.scenario?.name}</strong>
+              {scenario.scenario?.kind === "pick_failure" ? "抓取失败后不携带目标物；" : "提前放开后不再携带目标物；"}
+              {scenario.first_collision
+                ? `首次${scenario.first_collision.confidence === "unknown" ? "未知" : "危险"}区间 ${scenario.first_collision.time.toFixed(3)}s（S${scenario.first_collision.segment + 1}）`
+                : "未发现危险区间"}
+              {scenario.carried_ranges?.length ? `；实际携带范围 ${scenario.carried_ranges.map((range) => `${range.object_id}:${range.start_time.toFixed(2)}-${range.end_time.toFixed(2)}s`).join("，")}` : "；无确认携带范围"}
+              {scenario.unknown_ranges?.length ? `；无法确认 ${scenario.unknown_ranges.map((range) => `${range.start_time.toFixed(2)}-${range.end_time.toFixed(2)}s`).join("、")}` : ""}
+              <button onClick={() => replayAbnormalScenario(scenario)}><Play size={15} />重放分支</button>
+            </div>
+          ))}
           <RobotScene project={project} frame={frame} invalidTime={invalidTime} hazardWindow={result?.first_collision ? { start_time: result.first_collision.time, end_time: result.first_collision.end_time ?? result.first_collision.time } : null} />
           <div className="timeline">
             <button onClick={() => (playing ? setPlaying(false) : replayWindow ? replay() : replayFullMotion())}>
@@ -344,6 +375,78 @@ export default function App() {
             updated.place_events.push({ waypoint_index: updated.waypoints.length - 1, object_id: updated.carried_objects[0]?.id ?? "" });
             setProject(updated);
           }}>新增放置</button>
+
+          <h2>段间交接</h2>
+          {project.task_operations.map((operation, index) => (
+            <div className="limit-row" key={operation.id}>
+              <span>{operation.name}</span>
+              <input value={operation.version} onChange={(event) => {
+                const updated = cloneProject(project);
+                updated.task_operations[index].version = event.target.value;
+                setProject(updated);
+              }} />
+              <button onClick={() => {
+                const updated = cloneProject(project);
+                updated.task_operations[index].version = `op-${Date.now() % 100000}`;
+                setProject(updated);
+              }}>替换版本</button>
+            </div>
+          ))}
+          {project.handoff_conditions.map((handoff, index) => (
+            <div className="limit-row" key={handoff.id}>
+              <span>P{handoff.waypoint_index + 1}</span>
+              <select value={handoff.gripper_state} onChange={(event) => {
+                const updated = cloneProject(project);
+                updated.handoff_conditions[index].gripper_state = event.target.value as "open" | "closed";
+                setProject(updated);
+              }}>
+                <option value="closed">夹持</option>
+                <option value="open">放开</option>
+              </select>
+              <select value={handoff.confidence} onChange={(event) => {
+                const updated = cloneProject(project);
+                updated.handoff_conditions[index].confidence = event.target.value as "confirmed" | "unknown";
+                setProject(updated);
+              }}>
+                <option value="confirmed">确认</option>
+                <option value="unknown">未知</option>
+              </select>
+              <button onClick={() => {
+                const updated = cloneProject(project);
+                updated.handoff_conditions[index].pose = [...project.waypoints[handoff.waypoint_index]];
+                setProject(updated);
+              }}>采用当前姿态</button>
+            </div>
+          ))}
+
+          <h2>异常后续方案</h2>
+          {project.task_failure_events.map((failure, index) => (
+            <div className="limit-row" key={failure.id}>
+              <span>{failure.kind === "pick_failure" ? "抓取失败" : "提前放开"} P{failure.waypoint_index + 1}</span>
+              <NumberInput value={failure.waypoint_index + 1} step={1} onChange={(next) => {
+                const updated = cloneProject(project);
+                updated.task_failure_events[index].waypoint_index = Math.min(project.waypoints.length - 1, Math.max(0, next - 1));
+                setProject(updated);
+              }} />
+              <button onClick={() => {
+                const updated = cloneProject(project);
+                updated.task_failure_events.splice(index, 1);
+                setProject(updated);
+              }}>移除</button>
+            </div>
+          ))}
+          <button onClick={() => {
+            const updated = cloneProject(project);
+            const objectId = updated.carried_objects[0]?.id ?? "";
+            updated.task_failure_events.push({ id: `pick-fail-${Date.now()}`, name: "抓取失败后续", kind: "pick_failure", waypoint_index: updated.pick_events[0]?.waypoint_index ?? 0, object_id: objectId });
+            setProject(updated);
+          }}>增加抓取失败</button>
+          <button onClick={() => {
+            const updated = cloneProject(project);
+            const objectId = updated.carried_objects[0]?.id ?? "";
+            updated.task_failure_events.push({ id: `early-release-${Date.now()}`, name: "提前放开后续", kind: "early_release", waypoint_index: Math.min(updated.waypoints.length - 1, (updated.pick_events[0]?.waypoint_index ?? 0) + 1), object_id: objectId });
+            setProject(updated);
+          }}>增加提前放开</button>
 
           <h2>携带物体</h2>
           {project.carried_objects.map((item, index) => (

@@ -33,4 +33,21 @@ export const defaultProject: Project = {
   reviewed_segments: [],
   previous_validation_digest: null,
   baseline_snapshot: null,
+  task_operations: [
+    { id: "op-approach", name: "靠近并抓取", version: "op-1.0", start_waypoint_index: 0, end_waypoint_index: 1, report_digest: null },
+    { id: "op-transfer", name: "转运并放置", version: "op-1.0", start_waypoint_index: 1, end_waypoint_index: 3, report_digest: null },
+  ],
+  handoff_conditions: [
+    {
+      id: "handover-p1",
+      waypoint_index: 1,
+      source_operation_id: "op-approach",
+      target_operation_id: "op-transfer",
+      pose: [-0.2, 0.05, 0],
+      carried_object_id: "block-a",
+      gripper_state: "closed",
+      confidence: "confirmed",
+    },
+  ],
+  task_failure_events: [],
 };

@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -17,6 +19,34 @@ class CarriedObject(BaseModel):
 
 
 class CarryEvent(BaseModel):
+    waypoint_index: int = Field(ge=0)
+    object_id: str
+
+
+class TaskOperation(BaseModel):
+    id: str
+    name: str
+    version: str
+    start_waypoint_index: int = Field(ge=0)
+    end_waypoint_index: int = Field(ge=1)
+    report_digest: str | None = None
+
+
+class HandoffCondition(BaseModel):
+    id: str
+    waypoint_index: int = Field(ge=1)
+    source_operation_id: str
+    target_operation_id: str
+    pose: list[float] | None = None
+    carried_object_id: str | None = None
+    gripper_state: Literal["open", "closed"]
+    confidence: Literal["confirmed", "unknown"] = "confirmed"
+
+
+class TaskFailureEvent(BaseModel):
+    id: str
+    name: str
+    kind: Literal["pick_failure", "early_release"]
     waypoint_index: int = Field(ge=0)
     object_id: str
 
@@ -41,6 +71,9 @@ class Project(BaseModel):
     reviewed_segments: list[int] = []
     previous_validation_digest: str | None = None
     baseline_snapshot: dict | None = None
+    task_operations: list[TaskOperation] = []
+    handoff_conditions: list[HandoffCondition] = []
+    task_failure_events: list[TaskFailureEvent] = []
 
 
 class SavedProject(Project):

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import copy
+import hashlib
+import json
 from dataclasses import dataclass
 from math import cos, sin, sqrt
 import numpy as np
@@ -186,7 +189,41 @@ def active_object_for_segment(picks_by_waypoint, places_by_waypoint, segment_ind
     return next(iter(active), None) if active else None
 
 
-def validate_motion(
+def _carried_ranges(picks_by_waypoint, places_by_waypoint, durations):
+    boundaries = [0.0]
+    for duration in durations:
+        boundaries.append(boundaries[-1] + duration)
+    active = set()
+    started = {}
+    ranges = []
+    for index, current_time in enumerate(boundaries):
+        for object_id in places_by_waypoint.get(index, []):
+            active.discard(object_id)
+            ranges.append({
+                "object_id": object_id,
+                "start_time": started.pop(object_id, current_time),
+                "end_time": current_time,
+                "confidence": "confirmed",
+            })
+        for object_id in picks_by_waypoint.get(index, []):
+            active.add(object_id)
+            started[object_id] = current_time
+    for object_id in sorted(active):
+        ranges.append({
+            "object_id": object_id,
+            "start_time": started.get(object_id, boundaries[-1]),
+            "end_time": boundaries[-1],
+            "confidence": "confirmed",
+        })
+    return sorted(ranges, key=lambda item: (item["start_time"], item["object_id"]))
+
+
+def _stable_digest(value) -> str:
+    encoded = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_motion_core(
     waypoints: list[list[float]],
     speed_limits: list[float],
     joint_limits: list[tuple[float, float]],
@@ -204,6 +241,8 @@ def validate_motion(
     constraint_version: str = "1.1",
     reviewed_segments: list[int] | None = None,
     previous_validation_digest: str | None = None,
+    uncertain_from_segment: int | None = None,
+    uncertain_object_id: str | None = None,
 ) -> dict:
     dof = len(link_lengths)
     limits = _as_vector(speed_limits, "speed_limits", dof)
@@ -305,6 +344,18 @@ def validate_motion(
 
     def add_hazard(start_time: float, end_time: float, segment: int, kind: str, message: str, confidence: str = "interval") -> None:
         hazards.append(HazardInterval(start_time, end_time, segment, kind, message, confidence))
+
+    if uncertain_from_segment is not None:
+        uncertain_from_segment = max(0, min(uncertain_from_segment, len(segment_durations) - 1))
+        for segment in range(uncertain_from_segment, len(segment_durations)):
+            add_hazard(
+                float(boundaries[segment]),
+                float(boundaries[segment] + segment_durations[segment]),
+                segment,
+                "carry_state_unknown",
+                f"carried state for {uncertain_object_id or 'the manipulated object'} cannot be confirmed",
+                "unknown",
+            )
 
     for interval_index in range(len(check_samples) - 1):
         start_time = float(check_times[interval_index])
@@ -432,6 +483,8 @@ def validate_motion(
                 "links": [[float(x), float(y)] for x, y in vertices],
                 "carried_object_id": active_object_id,
                 "object_position": None if object_position is None else [float(object_position[0]), float(object_position[1])],
+                "gripper_state": "closed" if active_object_id is not None else "open",
+                "carry_confidence": "unknown" if uncertain_from_segment is not None and segment >= uncertain_from_segment else "confirmed",
             }
         )
 
@@ -446,7 +499,7 @@ def validate_motion(
     )
     reviewed = sorted({int(value) for value in (reviewed_segments or []) if 0 <= int(value) < len(segment_durations)})
     affected_segments = sorted({item.segment for item in hazards})
-    return {
+    result = {
         "valid": not hazards,
         "duration": float(display_times[-1]),
         "segment_durations": [float(value) for value in segment_durations],
@@ -473,4 +526,165 @@ def validate_motion(
             "fully_rechecked": not reviewed or not affected_segments,
         },
         "first_collision": None if first is None else first.__dict__,
+        "carried_ranges": _carried_ranges(picks_by_waypoint, places_by_waypoint, segment_durations),
+        "unknown_ranges": [] if uncertain_from_segment is None else [{
+            "start_time": float(boundaries[uncertain_from_segment]),
+            "end_time": float(display_times[-1]),
+            "object_id": uncertain_object_id,
+            "reason": "carry_state_unconfirmed",
+        }],
     }
+    return result
+
+
+def validate_motion(
+    *args,
+    task_operations: list[dict] | None = None,
+    handoff_conditions: list[dict] | None = None,
+    task_failure_events: list[dict] | None = None,
+    baseline_snapshot: dict | None = None,
+    **kwargs,
+) -> dict:
+    result = _validate_motion_core(*args, **kwargs)
+    waypoints = kwargs.get("waypoints") or (args[0] if args else [])
+    segment_count = max(0, len(waypoints) - 1)
+    boundaries = [0.0]
+    for duration in result["segment_durations"]:
+        boundaries.append(boundaries[-1] + duration)
+    operations = task_operations or []
+    handoffs = handoff_conditions or []
+    failures = task_failure_events or []
+
+    active_at = {}
+    picks_at = {}
+    places_at = {}
+    for event in kwargs.get("pick_events", []) or []:
+        picks_at.setdefault(int(event["waypoint_index"]), set()).add(str(event["object_id"]))
+    for event in kwargs.get("place_events", []) or []:
+        places_at.setdefault(int(event["waypoint_index"]), set()).add(str(event["object_id"]))
+    current = set()
+    for index in range(len(waypoints)):
+        current.difference_update(places_at.get(index, set()))
+        current.update(picks_at.get(index, set()))
+        active_at[index] = set(current)
+
+    handoff_issues = []
+    for handoff in handoffs:
+        waypoint_index = int(handoff["waypoint_index"])
+        if not 0 < waypoint_index <= segment_count:
+            continue
+        expected_object = next(iter(active_at.get(waypoint_index, set())), None)
+        expected_gripper = "closed" if expected_object else "open"
+        pose = handoff.get("pose")
+        unknown = handoff.get("confidence") == "unknown"
+        if pose is not None and [float(value) for value in pose] != [float(value) for value in waypoints[waypoint_index]]:
+            handoff_issues.append((waypoint_index, "handoff_pose_mismatch", "handoff pose does not match the actual trajectory waypoint", "unknown" if unknown else "interval"))
+        if handoff.get("carried_object_id") != expected_object:
+            handoff_issues.append((waypoint_index, "handoff_carry_unknown" if unknown else "handoff_carry_mismatch", "handoff carried object does not match the previous operation endpoint", "unknown" if unknown else "interval"))
+        if handoff.get("gripper_state") != expected_gripper:
+            handoff_issues.append((waypoint_index, "handoff_gripper_mismatch", "handoff gripper state does not match the planned carried object", "unknown" if unknown else "interval"))
+
+    def add_issues(target, issues):
+        target = copy.deepcopy(target)
+        for item in target["hazard_intervals"]:
+            item.setdefault("time", item["start_time"])
+        target["hazard_intervals"].extend([
+            {
+                "start_time": float(boundaries[segment]),
+                "end_time": float(boundaries[segment]),
+                "segment": segment,
+                "kind": kind,
+                "message": message,
+                "time": float(boundaries[segment]),
+                "confidence": confidence,
+            }
+            for segment, kind, message, confidence in issues
+        ])
+        target["hazard_intervals"].sort(key=lambda item: (item["start_time"], item["end_time"], item["kind"]))
+        for item in target["hazard_intervals"]:
+            item.setdefault("time", item["start_time"])
+        target["collisions"] = target["hazard_intervals"][:20]
+        target["valid"] = not target["hazard_intervals"]
+        target["first_collision"] = target["hazard_intervals"][0] if target["hazard_intervals"] else None
+        first_hazard = target["first_collision"]
+        target["replay_window"] = None if first_hazard is None else {
+            "start_time": max(0.0, first_hazard["start_time"] - max(target["collision_check_dt"], target["display_sample_dt"])),
+            "end_time": min(target["duration"], first_hazard["end_time"] + max(target["collision_check_dt"], target["display_sample_dt"])),
+            "segment": first_hazard["segment"],
+        }
+        return target
+
+    result = add_issues(result, handoff_issues)
+    segment_provenance = []
+    configured_speeds = kwargs.get("segment_speed_limits")
+    for segment in range(segment_count):
+        operation = next((item for item in operations if int(item["start_waypoint_index"]) <= segment < int(item["end_waypoint_index"])), None)
+        handoff = next((item for item in handoffs if int(item["waypoint_index"]) == segment), None)
+        source = {
+            "segment": segment,
+            "operation_id": None if operation is None else operation.get("id"),
+            "operation_version": None if operation is None else operation.get("version"),
+            "operation_report_digest": None if operation is None else operation.get("report_digest"),
+            "incoming_handoff_id": None if handoff is None else handoff.get("id"),
+            "handoff_condition": None if handoff is None else {
+                key: handoff.get(key)
+                for key in ("waypoint_index", "carried_object_id", "gripper_state", "confidence", "pose")
+            },
+            "configuration_digest": _stable_digest({
+                "start_pose": waypoints[segment],
+                "end_pose": waypoints[segment + 1],
+                "speed_limits": configured_speeds[segment] if configured_speeds else kwargs.get("speed_limits", args[1] if len(args) > 1 else []),
+            }),
+        }
+        source["digest"] = _stable_digest(source)
+        segment_provenance.append(source)
+
+    previous_provenance = {}
+    if isinstance(baseline_snapshot, dict):
+        for item in (baseline_snapshot.get("task_review") or {}).get("segment_provenance", []):
+            previous_provenance[int(item["segment"])] = item.get("digest")
+    changed_segments = [item["segment"] for item in segment_provenance if previous_provenance.get(item["segment"]) not in (None, item["digest"])]
+    recheck_required = set(range(min(changed_segments), segment_count)) if changed_segments else set()
+    if operations and not previous_provenance:
+        recheck_required.update(range(segment_count))
+    result["task_review"] = {
+        "operations": copy.deepcopy(operations),
+        "handoff_conditions": copy.deepcopy(handoffs),
+        "segment_provenance": segment_provenance,
+        "changed_segments": sorted(changed_segments),
+        "revalidation_required_segments": sorted(recheck_required),
+        "baseline_digest": None if baseline_snapshot is None else _stable_digest(baseline_snapshot),
+    }
+
+    abnormal_scenarios = []
+    for failure in failures:
+        waypoint_index = int(failure["waypoint_index"])
+        object_id = str(failure["object_id"])
+        scenario_kwargs = dict(kwargs)
+        scenario_kwargs["pick_events"] = [
+            event for event in (kwargs.get("pick_events") or [])
+            if not (failure["kind"] == "pick_failure" and int(event["waypoint_index"]) == waypoint_index and str(event["object_id"]) == object_id)
+        ]
+        kept_places = [
+            event for event in (kwargs.get("place_events") or [])
+            if not (failure["kind"] == "pick_failure" and str(event["object_id"]) == object_id)
+        ]
+        scenario_kwargs["place_events"] = [
+            event for event in kept_places
+            if not (failure["kind"] == "early_release" and int(event["waypoint_index"]) >= waypoint_index and str(event["object_id"]) == object_id)
+        ]
+        if failure["kind"] == "early_release":
+            scenario_kwargs["place_events"].append({"waypoint_index": waypoint_index, "object_id": object_id})
+        scenario_kwargs["uncertain_from_segment"] = min(waypoint_index, segment_count - 1) if segment_count else None
+        scenario_kwargs["uncertain_object_id"] = object_id
+        scenario = _validate_motion_core(*args, **scenario_kwargs)
+        scenario["scenario"] = {
+            "id": failure.get("id"),
+            "name": failure.get("name"),
+            "kind": failure["kind"],
+            "waypoint_index": waypoint_index,
+            "object_id": object_id,
+        }
+        abnormal_scenarios.append(scenario)
+    result["abnormal_scenarios"] = abnormal_scenarios
+    return result

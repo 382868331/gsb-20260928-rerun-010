@@ -31,6 +31,10 @@ def project_validation_kwargs(project: Project) -> dict:
         "constraint_version": project.constraint_version,
         "reviewed_segments": project.reviewed_segments,
         "previous_validation_digest": project.previous_validation_digest,
+        "task_operations": [item.model_dump() for item in project.task_operations],
+        "handoff_conditions": [item.model_dump() for item in project.handoff_conditions],
+        "task_failure_events": [item.model_dump() for item in project.task_failure_events],
+        "baseline_snapshot": project.baseline_snapshot,
     }
 
 
