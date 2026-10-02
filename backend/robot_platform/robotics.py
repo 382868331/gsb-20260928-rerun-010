@@ -68,11 +68,10 @@ def interpolate_trajectory(
 ) -> tuple[list[float], list[np.ndarray], list[float]]:
     if sample_dt <= 0:
         raise ValueError("sample_dt must be positive")
-    if len(waypoints) < 2:
-        raise ValueError("at least two waypoints are required")
-
     dof = len(waypoints[0])
     points = [_as_vector(values, "waypoint", dof) for values in waypoints]
+    if not points:
+        raise ValueError("at least one waypoint is required")
     limits_by_segment = normalize_segment_limits(len(points) - 1, dof, speed_limits, segment_speed_limits)
     durations = [
         segment_duration(points[index + 1] - points[index], limits_by_segment[index])
@@ -188,6 +187,61 @@ def active_object_for_segment(picks_by_waypoint, places_by_waypoint, segment_ind
     return next(iter(active), None) if active else None
 
 
+def _end_effector_velocity(joint_angles: np.ndarray, joint_velocity: np.ndarray, link_lengths: list[float]) -> dict:
+    x = y = angle = 0.0
+    joint_positions = [(0.0, 0.0)]
+    for joint_angle, length in zip(joint_angles, link_lengths):
+        angle += float(joint_angle)
+        x += length * cos(angle)
+        y += length * sin(angle)
+        joint_positions.append((x, y))
+
+    linear_x = linear_y = 0.0
+    for joint_index, joint_position in enumerate(joint_positions[:-1]):
+        end_x, end_y = joint_positions[-1]
+        dx = end_x - joint_position[0]
+        dy = end_y - joint_position[1]
+        speed = float(joint_velocity[joint_index])
+        linear_x += -dy * speed
+        linear_y += dx * speed
+    angular_velocity = float(np.sum(joint_velocity))
+    return {
+        "linear_velocity": [linear_x, linear_y],
+        "angular_velocity": angular_velocity,
+    }
+
+
+def _boundary_dynamic_state(
+    points: list[np.ndarray],
+    velocities: list[np.ndarray],
+    durations: list[float],
+    link_lengths: list[float],
+    carried_object_id: str | None,
+    side: str,
+    wait_duration: float = 0.0,
+) -> dict:
+    nonzero = [index for index, duration in enumerate(durations) if duration > 0.0]
+    if not nonzero:
+        motion_kind = "unconstrained_zero_duration"
+        joint_velocity = [0.0 for _ in link_lengths]
+    else:
+        edge_index = nonzero[0] if side == "start" else nonzero[-1]
+        motion_kind = "motion"
+        joint_velocity = [float(value) for value in velocities[edge_index]]
+    angles = points[0] if side == "start" else points[-1]
+    is_turn_in_place = motion_kind == "motion" and np.allclose(points[0], points[-1], atol=1e-9)
+    endpoint_motion = _end_effector_velocity(angles, np.asarray(joint_velocity, dtype=float), link_lengths)
+    return {
+        "motion_kind": "wait" if wait_duration > 0 else ("turn_in_place" if is_turn_in_place else motion_kind),
+        "joint_angles": [float(value) for value in angles],
+        "joint_velocities": joint_velocity,
+        "translation_velocity": endpoint_motion["linear_velocity"],
+        "rotation_velocity": endpoint_motion["angular_velocity"],
+        "carried_object_id": None if carried_object_id is None else str(carried_object_id),
+        "available_buffer_time": float(wait_duration),
+    }
+
+
 def validate_motion(
     waypoints: list[list[float]],
     speed_limits: list[float],
@@ -207,6 +261,7 @@ def validate_motion(
     reviewed_segments: list[int] | None = None,
     previous_validation_digest: str | None = None,
     initial_carried_object_id: str | None = None,
+    wait_duration: float = 0.0,
 ) -> dict:
     dof = len(link_lengths)
     limits = _as_vector(speed_limits, "speed_limits", dof)
@@ -224,6 +279,8 @@ def validate_motion(
         raise ValueError("gripper_radius must be positive")
     if velocity_transition_time <= 0:
         raise ValueError("velocity_transition_time must be positive")
+    if wait_duration < 0:
+        raise ValueError("wait_duration must be non-negative")
     if np.any(acceleration <= 0):
         raise ValueError("acceleration limits must be positive")
 
@@ -282,7 +339,19 @@ def validate_motion(
         waypoints, speed_limits, COLLISION_CHECK_DT, segment_speed_limits
     )
     points = [np.asarray(values, dtype=float) for values in waypoints]
+    if len(points) < 2 and wait_duration <= 0:
+        raise ValueError("at least two waypoints are required")
     velocities = segment_velocities(points, segment_durations)
+    moving_duration = float(sum(segment_durations))
+    stationary_action = moving_duration == 0.0
+    if wait_duration > 0.0 and not stationary_action:
+        raise ValueError("wait_duration is only supported for a stationary wait operation")
+    duration = moving_duration + float(wait_duration)
+    if wait_duration > 0.0:
+        display_times.append(duration)
+        display_samples.append(points[-1].copy())
+        check_times.append(duration)
+        check_samples.append(points[-1].copy())
     boundaries = np.cumsum([0.0, *segment_durations[:-1]])
     hazards: list[HazardInterval] = []
 
@@ -304,10 +373,11 @@ def validate_motion(
     planned_events: list[dict] = []
     elapsed = 0.0
     for index in range(len(points)):
+        event_time = elapsed + (wait_duration if index == len(points) - 1 and stationary_action else 0.0)
         for object_id in places_by_waypoint.get(index, []):
-            planned_events.append({"type": "place", "waypoint_index": index, "object_id": object_id, "time": elapsed})
+            planned_events.append({"type": "place", "waypoint_index": index, "object_id": object_id, "time": event_time})
         for object_id in picks_by_waypoint.get(index, []):
-            planned_events.append({"type": "pick", "waypoint_index": index, "object_id": object_id, "time": elapsed})
+            planned_events.append({"type": "pick", "waypoint_index": index, "object_id": object_id, "time": event_time})
         if index < len(segment_durations):
             elapsed += segment_durations[index]
 
@@ -458,7 +528,9 @@ def validate_motion(
     affected_segments = sorted({item.segment for item in hazards})
     return {
         "valid": not hazards,
-        "duration": float(display_times[-1]),
+        "duration": duration,
+        "motion_duration": moving_duration,
+        "wait_duration": float(wait_duration),
         "start_state": {
             "joint_angles": [float(value) for value in points[0]],
             "carried_object_id": None if initial_carried_object_id is None else str(initial_carried_object_id),
@@ -467,6 +539,17 @@ def validate_motion(
             "joint_angles": [float(value) for value in points[-1]],
             "carried_object_id": final_carried_object_id,
         },
+        "dynamic_state": {
+            "at_start": _boundary_dynamic_state(
+                points, velocities, segment_durations, link_lengths,
+                initial_carried_object_id, "start", wait_duration,
+            ),
+            "at_end": _boundary_dynamic_state(
+                points, velocities, segment_durations, link_lengths,
+                final_carried_object_id, "end", wait_duration,
+            ),
+        },
+        "segment_velocities": [[float(value) for value in velocity] for velocity in velocities],
         "segment_durations": [float(value) for value in segment_durations],
         "frames": frames,
         "planned_events": planned_events,
@@ -480,7 +563,7 @@ def validate_motion(
         "hazard_intervals": [item.__dict__ for item in hazards],
         "replay_window": None if first_hazard is None else {
             "start_time": max(0.0, first_hazard.start_time - max(COLLISION_CHECK_DT, sample_dt)),
-            "end_time": min(float(display_times[-1]), first_hazard.end_time + max(COLLISION_CHECK_DT, sample_dt)),
+            "end_time": min(duration, first_hazard.end_time + max(COLLISION_CHECK_DT, sample_dt)),
             "segment": first_hazard.segment,
         },
         "review": {

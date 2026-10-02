@@ -33,4 +33,5 @@ export const defaultProject: Project = {
   reviewed_segments: [],
   previous_validation_digest: null,
   baseline_snapshot: null,
+  wait_duration: 0,
 };

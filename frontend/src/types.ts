@@ -38,6 +38,7 @@ export type Project = {
   reviewed_segments: number[];
   previous_validation_digest: string | null;
   baseline_snapshot: ValidationResult | null;
+  wait_duration: number;
 };
 
 export type PlannedEvent = {
@@ -75,8 +76,13 @@ export type Frame = {
 
 export type ValidationResult = {
   valid: boolean;
+  execution_status?: "executable" | "violated" | "unknown";
   duration: number;
+  motion_duration?: number;
+  wait_duration?: number;
   segment_durations: number[];
+  segment_velocities?: number[][];
+  dynamic_state?: BoundaryDynamicStatePair;
   frames: Frame[];
   planned_events: PlannedEvent[];
   constraint_version: string;
@@ -93,6 +99,21 @@ export type ValidationResult = {
     stale_segments: number[];
     fully_rechecked: boolean;
   };
+};
+
+export type BoundaryDynamicState = {
+  motion_kind: string;
+  joint_angles: number[];
+  joint_velocities: number[];
+  translation_velocity: number[];
+  rotation_velocity: number;
+  carried_object_id: string | null;
+  available_buffer_time: number;
+};
+
+export type BoundaryDynamicStatePair = {
+  at_start: BoundaryDynamicState;
+  at_end: BoundaryDynamicState;
 };
 
 export type SavedProject = Project & {
@@ -143,6 +164,7 @@ export type TaskHazard = {
 export type HandoverState = {
   joint_angles: number[];
   carried_object_id: string | null;
+  dynamic?: BoundaryDynamicState;
 };
 
 export type TaskSegmentResult = {
@@ -154,6 +176,7 @@ export type TaskSegmentResult = {
   handover_in: HandoverState;
   handover_out: HandoverState | null;
   valid: boolean;
+  execution_status: "executable" | "violated" | "unknown";
   error: string | null;
   report: ValidationResult | null;
 };
@@ -184,6 +207,7 @@ export type TaskReplayWindow = {
 
 export type TaskPlanResult = {
   valid: boolean;
+  execution_status: "executable" | "violated" | "unknown";
   duration: number;
   segments: Omit<TaskSegmentResult, "report">[];
   hazards: TaskHazard[];
@@ -195,6 +219,7 @@ export type TaskPlanResult = {
 
 export type TaskResult = {
   valid: boolean;
+  execution_status: "executable" | "violated" | "unknown";
   duration: number;
   constraint_version: string;
   handover_tolerance: number;

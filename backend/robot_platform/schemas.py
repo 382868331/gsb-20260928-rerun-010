@@ -43,6 +43,7 @@ class Project(BaseModel):
     reviewed_segments: list[int] = []
     previous_validation_digest: str | None = None
     baseline_snapshot: dict | None = None
+    wait_duration: float = Field(default=0.0, ge=0)
 
 
 class SavedProject(Project):
