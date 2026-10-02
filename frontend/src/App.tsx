@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, CheckCircle2, Pause, Play, RotateCcw, Save, ScanSearch } from "lucide-react";
-import { getProject, listProjects, saveProject, updateProject, validateProject, validateProjectSegments } from "./api";
+import { getProject, getTask, listProjects, listTasks, saveProject, saveTask, updateProject, updateTask, validateProject, validateProjectSegments, validateTask } from "./api";
 import { defaultProject } from "./defaults";
 import RobotScene from "./RobotScene";
-import type { CarryEvent, Frame, Project, SavedProject, ValidationResult } from "./types";
+import type { CarryEvent, FailureSpec, Frame, Project, SavedProject, SavedTask, TaskDefinition, TaskFrame, TaskResult, ValidationResult } from "./types";
 
 const cloneProject = (project: Project): Project => JSON.parse(JSON.stringify(project));
 
@@ -42,13 +42,28 @@ export default function App() {
   const [playing, setPlaying] = useState(false);
   const [message, setMessage] = useState<string>("");
   const [savedProjects, setSavedProjects] = useState<SavedProject[]>([]);
-  const [currentId, setCurrentId] = useState<string | null>(null);
-  const [replayWindow, setReplayWindow] = useState<{ start: number; end: number } | null>(null);
-  const startedAt = useRef(0);
-  const offset = useRef(0);
+ const [currentId, setCurrentId] = useState<string | null>(null);
+ const [replayWindow, setReplayWindow] = useState<{ start: number; end: number } | null>(null);
+ const startedAt = useRef(0);
+ const offset = useRef(0);
 
-  const frame: Frame | null = result?.frames[frameIndex] ?? null;
-  const invalidTime = result?.valid ? null : replayWindow?.end ?? result?.first_collision?.end_time ?? result?.first_collision?.time ?? null;
+  const [task, setTask] = useState<TaskDefinition>({ name: "串联任务", segments: [], failures: [], handover_tolerance: 1e-6, constraint_version: "1.1" });
+  const [taskResult, setTaskResult] = useState<TaskResult | null>(null);
+  const [taskMode, setTaskMode] = useState(false);
+  const [abnormalView, setAbnormalView] = useState(false);
+  const [savedTasks, setSavedTasks] = useState<SavedTask[]>([]);
+  const [currentTaskId, setCurrentTaskId] = useState<string | null>(null);
+
+  const activeTaskPlan = taskMode && taskResult ? (abnormalView && taskResult.abnormal ? taskResult.abnormal : taskResult) : null;
+  const viewFrames: Frame[] = activeTaskPlan ? activeTaskPlan.frames : result?.frames ?? [];
+  const viewDuration = activeTaskPlan ? activeTaskPlan.duration : result?.duration ?? 0;
+  const frame: Frame | null = viewFrames[frameIndex] ?? null;
+  const taskFirstHazard = activeTaskPlan?.first_hazard ?? null;
+  const invalidTime = taskMode
+    ? replayWindow?.end ?? taskFirstHazard?.end_time ?? taskFirstHazard?.start_time ?? null
+    : result?.valid ? null : replayWindow?.end ?? result?.first_collision?.end_time ?? result?.first_collision?.time ?? null;
+  const taskFrame = taskMode && frame ? (frame as TaskFrame) : null;
+  const sceneProject = taskFrame ? task.segments[taskFrame.segment]?.operation ?? project : project;
 
   const validate = useCallback(async (nextProject = project, shouldPlay = false) => {
     setMessage("");
@@ -73,14 +88,18 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!playing || !result) return;
+    listTasks().then(setSavedTasks).catch(() => setSavedTasks([]));
+  }, []);
+
+  useEffect(() => {
+    if (!playing || viewFrames.length === 0) return;
     startedAt.current = performance.now();
     let animation = 0;
     const tick = () => {
       const elapsed = offset.current + (performance.now() - startedAt.current) / 1000;
-      const cutoff = invalidTime ?? result.duration;
-      const nextIndex = result.frames.findIndex((item) => item.time >= elapsed);
-      setFrameIndex(nextIndex === -1 ? result.frames.length - 1 : nextIndex);
+      const cutoff = invalidTime ?? viewDuration;
+      const nextIndex = viewFrames.findIndex((item) => item.time >= elapsed);
+      setFrameIndex(nextIndex === -1 ? viewFrames.length - 1 : nextIndex);
       if (elapsed >= cutoff) {
         setPlaying(false);
         offset.current = cutoff;
@@ -90,10 +109,10 @@ export default function App() {
     };
     animation = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(animation);
-  }, [playing, result, invalidTime, replayWindow]);
+  }, [playing, viewFrames, viewDuration, invalidTime, replayWindow]);
 
   const seek = (index: number) => {
-    const nextFrame = result?.frames[index];
+    const nextFrame = viewFrames[index];
     setPlaying(false);
     setReplayWindow(null);
     setFrameIndex(index);
@@ -103,18 +122,18 @@ export default function App() {
   const replay = () => {
     const start = replayWindow?.start ?? 0;
     offset.current = start;
-    const nextIndex = result?.frames.findIndex((frame) => frame.time >= start) ?? 0;
+    const nextIndex = viewFrames.findIndex((frame) => frame.time >= start);
     setFrameIndex(nextIndex === -1 ? 0 : nextIndex);
     setPlaying(true);
   };
 
   const replayNearFirstHazard = () => {
-    const window = result?.replay_window;
-    if (!window || !result) return;
+    const window = taskMode ? taskResult?.replay_window : result?.replay_window;
+    if (!window) return;
     const nextWindow = { start: window.start_time, end: window.end_time };
     setReplayWindow(nextWindow);
     offset.current = nextWindow.start;
-    const nextIndex = result.frames.findIndex((frame) => frame.time >= nextWindow.start);
+    const nextIndex = viewFrames.findIndex((frame) => frame.time >= nextWindow.start);
     setFrameIndex(nextIndex === -1 ? 0 : nextIndex);
     setPlaying(true);
   };
@@ -187,10 +206,102 @@ export default function App() {
     await validate(nextProject);
   };
 
+  const addTaskSegment = () => {
+    setTask((current) => ({
+      ...current,
+      segments: [
+        ...current.segments,
+        { segment_id: `seg-${Date.now()}-${current.segments.length}`, name: project.name, operation: cloneProject(project) },
+      ],
+    }));
+  };
+
+  const replaceTaskSegment = (index: number) => {
+    setTask((current) => {
+      const segments = [...current.segments];
+      segments[index] = { ...segments[index], name: project.name, operation: cloneProject(project) };
+      return { ...current, segments };
+    });
+  };
+
+  const removeTaskSegment = (index: number) => {
+    setTask((current) => ({
+      ...current,
+      segments: current.segments.filter((_, itemIndex) => itemIndex !== index),
+      failures: current.failures
+        .filter((failure) => failure.segment_index !== index)
+        .map((failure) => (failure.segment_index > index ? { ...failure, segment_index: failure.segment_index - 1 } : failure)),
+    }));
+  };
+
+  const updateFailure = (index: number, patch: Partial<FailureSpec>) => {
+    setTask((current) => ({
+      ...current,
+      failures: current.failures.map((failure, itemIndex) => (itemIndex === index ? { ...failure, ...patch } : failure)),
+    }));
+  };
+
+  const runTaskValidation = async (nextTask: TaskDefinition = task) => {
+    setMessage("");
+    try {
+      const validation = await validateTask(nextTask, taskResult?.conclusion_sources ?? null);
+      setTaskResult(validation);
+      setTaskMode(true);
+      setAbnormalView(false);
+      setReplayWindow(null);
+      setFrameIndex(0);
+      offset.current = 0;
+      setPlaying(false);
+      if (!validation.valid) {
+        setMessage(`完整任务被拒绝：${validation.first_hazard?.message ?? "存在危险区间"}`);
+      } else if (validation.stale_segments.length > 0) {
+        setMessage(`以下段的旧结论需重新核对：${validation.stale_segments.map((item) => `段${item.segment + 1}`).join("、")}`);
+      }
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "任务校验失败");
+    }
+  };
+
+  const persistTask = async () => {
+    const saved = currentTaskId ? await updateTask(currentTaskId, task) : await saveTask(task);
+    setCurrentTaskId(saved.id);
+    setSavedTasks(await listTasks());
+    if (saved.last_task_validation) {
+      setTaskResult(saved.last_task_validation);
+      setTaskMode(true);
+    }
+    setMessage(saved.executable ? `任务已保存并确认可执行：${saved.name}` : `任务已保存为草稿：${saved.name}（存在危险或未知区间）`);
+  };
+
+  const loadTask = async (id: string) => {
+    const saved = await getTask(id);
+    const { id: _id, executable: _executable, validation_digest: _digest, last_task_validation, validation_error: _error, ...definition } = saved;
+    setCurrentTaskId(id);
+    setTask(definition);
+    if (last_task_validation) {
+      setTaskResult(last_task_validation);
+      setTaskMode(true);
+      setAbnormalView(false);
+      setReplayWindow(null);
+      setFrameIndex(0);
+      offset.current = 0;
+    }
+  };
+
+  const taskObjectOptions = useMemo(() => {
+    const byId = new Map<string, string>();
+    task.segments.forEach((segment) => segment.operation.carried_objects.forEach((item) => byId.set(item.id, item.name)));
+    return Array.from(byId, ([id, name]) => ({ id, name }));
+  }, [task.segments]);
+
   const collisionAtCurrent = useMemo(() => {
-    if (!frame || !result) return null;
-    return result.collisions.find((collision) => Math.abs(collision.time - frame.time) < project.sample_dt) ?? null;
-  }, [frame, result, project.sample_dt]);
+    if (!frame) return null;
+    if (taskMode && taskResult) {
+      return taskResult.hazards.find((hazard) => Math.abs(hazard.start_time - frame.time) < 0.02)?.message ?? null;
+    }
+    if (!result) return null;
+    return result.collisions.find((collision) => Math.abs(collision.time - frame.time) < project.sample_dt)?.message ?? null;
+  }, [frame, result, taskMode, taskResult, project.sample_dt]);
 
   return (
     <main className="app-shell">
@@ -208,6 +319,32 @@ export default function App() {
 
       <section className="workspace">
         <div className="viewer-card">
+          {taskMode && taskResult && (
+            <div className={`message ${taskResult.valid ? "" : "warning"}`}>
+              <AlertTriangle size={15} />
+              完整任务「{task.name}」：{taskResult.valid ? "各段与段间交接均安全" : "存在危险或未知区间"}
+              {taskResult.comparison.first_concern_time != null &&
+                `；首次危险/未知 ${taskResult.comparison.first_concern_time.toFixed(3)}s（${
+                  taskResult.comparison.first_concern_source === "normal"
+                    ? "正常方案"
+                    : taskResult.comparison.first_concern_source === "abnormal"
+                      ? "异常后续方案"
+                      : "无法确认"
+                }）`}
+              {abnormalView && "（当前查看：异常后续方案）"}
+              {taskResult.replay_window && (
+                <button onClick={replayNearFirstHazard}>
+                  <ScanSearch size={15} />重放首次危险区间{taskResult.replay_window.crosses_boundary ? "（跨段边界）" : ""}
+                </button>
+              )}
+              {taskResult.abnormal && (
+                <button onClick={() => { setAbnormalView(!abnormalView); setFrameIndex(0); offset.current = 0; setReplayWindow(null); }}>
+                  {abnormalView ? "查看正常方案" : "查看异常后续方案"}
+                </button>
+              )}
+              <button onClick={() => setTaskMode(false)}>返回单段视图</button>
+            </div>
+          )}
           <div className="status-row">
             {result?.valid ? (
               <span className="status ok"><CheckCircle2 size={17} />轨迹安全</span>
@@ -234,7 +371,14 @@ export default function App() {
               <button onClick={recheckChangedSegments}><RotateCcw size={15} />复核局部轨迹</button>
             </div>
           )}
-          <RobotScene project={project} frame={frame} invalidTime={invalidTime} hazardWindow={result?.first_collision ? { start_time: result.first_collision.time, end_time: result.first_collision.end_time ?? result.first_collision.time } : null} />
+          <RobotScene
+            project={sceneProject}
+            frame={frame}
+            invalidTime={invalidTime}
+            hazardWindow={taskMode
+              ? taskFirstHazard ? { start_time: taskFirstHazard.start_time, end_time: taskFirstHazard.end_time } : null
+              : result?.first_collision ? { start_time: result.first_collision.time, end_time: result.first_collision.end_time ?? result.first_collision.time } : null}
+          />
           <div className="timeline">
             <button onClick={() => (playing ? setPlaying(false) : replayWindow ? replay() : replayFullMotion())}>
               {playing ? <Pause size={16} /> : <Play size={16} />}{playing ? "暂停" : "重放"}
@@ -242,13 +386,13 @@ export default function App() {
             <input
               type="range"
               min={0}
-              max={Math.max(0, (result?.frames.length ?? 1) - 1)}
+              max={Math.max(0, viewFrames.length - 1)}
               value={frameIndex}
               onChange={(event) => seek(Number(event.target.value))}
             />
           </div>
           {message && <div className="message"><AlertTriangle size={15} />{message}</div>}
-          {collisionAtCurrent && <div className="message">当前采样点：{collisionAtCurrent.message}</div>}
+          {collisionAtCurrent && <div className="message">当前采样点：{collisionAtCurrent}</div>}
         </div>
 
         <aside className="editor">
@@ -426,6 +570,89 @@ export default function App() {
               }} />
             </div>
           ))}
+
+          <h2>工程库</h2>
+          <h2>任务串联</h2>
+          <label className="single-input">任务名
+            <input value={task.name} onChange={(event) => setTask({ ...task, name: event.target.value })} />
+          </label>
+          {task.segments.map((segment, index) => {
+            const segmentResult = taskResult?.segments[index];
+            const stale = taskResult?.stale_segments.find((item) => item.segment === index);
+            const handoverHazard = taskResult?.hazards.find(
+              (hazard) => hazard.segment === index && hazard.kind.startsWith("handover"),
+            );
+            return (
+              <div className="limit-row" key={segment.segment_id}>
+                <span>
+                  段{index + 1} {segment.name}
+                  {segmentResult ? (segmentResult.valid ? "·安全" : "·危险") : "·未校验"}
+                  {stale ? "·需复核" : ""}
+                  {index > 0 && (handoverHazard ? "·交接异常" : segmentResult?.handover_out ? "·交接一致" : "")}
+                </span>
+                <button onClick={() => replaceTaskSegment(index)}>替换为当前工程</button>
+                <button className="icon" onClick={() => removeTaskSegment(index)}>×</button>
+              </div>
+            );
+          })}
+          <button onClick={addTaskSegment}>加入当前工程为一段</button>
+          <button className="primary" onClick={() => runTaskValidation()} disabled={task.segments.length < 2}>
+            校验完整任务
+          </button>
+          {taskResult && (
+            <div className="message">
+              实际携带：
+              {(abnormalView && taskResult.abnormal ? taskResult.abnormal.carried_ranges : taskResult.carried_ranges)
+                .map((range) => `${range.object_id} 段${range.segment_index + 1} ${range.start_time.toFixed(2)}–${range.end_time.toFixed(2)}s`)
+                .join("；") || "无"}
+              {taskResult.unknown_intervals.length > 0 &&
+                `；无法确认：${taskResult.unknown_intervals
+                  .map((interval) => `${interval.start_time.toFixed(2)}s 起（段${interval.segment + 1}）`)
+                  .join("、")}`}
+            </div>
+          )}
+
+          <h2>异常假设</h2>
+          {task.failures.map((failure, index) => (
+            <div className="limit-row" key={index}>
+              <select value={failure.segment_index} onChange={(event) => updateFailure(index, { segment_index: Number(event.target.value) })}>
+                {task.segments.map((segment, segmentIndex) => (
+                  <option key={segment.segment_id} value={segmentIndex}>段{segmentIndex + 1}</option>
+                ))}
+              </select>
+              <select value={failure.type} onChange={(event) => updateFailure(index, { type: event.target.value as FailureSpec["type"] })}>
+                <option value="pick_failed">抓取失败</option>
+                <option value="early_release">提前放开</option>
+              </select>
+              <select value={failure.object_id} onChange={(event) => updateFailure(index, { object_id: event.target.value })}>
+                {taskObjectOptions.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+              </select>
+              {failure.type === "early_release" && (
+                <NumberInput
+                  value={(failure.waypoint_index ?? 0) + 1}
+                  step={1}
+                  onChange={(next) => updateFailure(index, { waypoint_index: Math.max(0, Math.round(next) - 1) })}
+                />
+              )}
+              <button className="icon" onClick={() => setTask({ ...task, failures: task.failures.filter((_, itemIndex) => itemIndex !== index) })}>×</button>
+            </div>
+          ))}
+          <button onClick={() => {
+            if (task.segments.length === 0 || taskObjectOptions.length === 0) return;
+            setTask({
+              ...task,
+              failures: [...task.failures, { segment_index: 0, type: "pick_failed", object_id: taskObjectOptions[0].id, waypoint_index: null }],
+            });
+          }}>新增异常假设</button>
+
+          <h2>任务库</h2>
+          <button onClick={persistTask} disabled={task.segments.length < 2}><Save size={16} />保存任务</button>
+          <select value={currentTaskId ?? ""} onChange={(event) => event.target.value && loadTask(event.target.value)}>
+            <option value="">选择已保存任务</option>
+            {savedTasks.map((item) => (
+              <option key={item.id} value={item.id}>{item.name}{item.executable ? " [executable]" : " [draft]"}</option>
+            ))}
+          </select>
 
           <h2>工程库</h2>
           <select value={currentId ?? ""} onChange={(event) => event.target.value && load(event.target.value)}>

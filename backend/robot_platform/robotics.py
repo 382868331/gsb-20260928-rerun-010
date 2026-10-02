@@ -178,8 +178,10 @@ def carried_object_pose(vertices, angles, carried_object):
     return end_x + rotated_x, end_y + rotated_y
 
 
-def active_object_for_segment(picks_by_waypoint, places_by_waypoint, segment_index):
+def active_object_for_segment(picks_by_waypoint, places_by_waypoint, segment_index, initial=None):
     active = set()
+    if initial is not None:
+        active.add(initial)
     for index in range(segment_index + 1):
         active.update(picks_by_waypoint.get(index, []))
         active.difference_update(places_by_waypoint.get(index + 1, []))
@@ -204,6 +206,7 @@ def validate_motion(
     constraint_version: str = "1.1",
     reviewed_segments: list[int] | None = None,
     previous_validation_digest: str | None = None,
+    initial_carried_object_id: str | None = None,
 ) -> dict:
     dof = len(link_lengths)
     limits = _as_vector(speed_limits, "speed_limits", dof)
@@ -227,6 +230,8 @@ def validate_motion(
     objects_by_id = {str(item["id"]): item for item in (carried_objects or [])}
     if len(objects_by_id) != len(carried_objects or []):
         raise ValueError("carried object ids must be unique")
+    if initial_carried_object_id is not None and str(initial_carried_object_id) not in objects_by_id:
+        raise ValueError(f"initial carried object {initial_carried_object_id} is not defined")
     pick_events = pick_events or []
     place_events = place_events or []
     pick_keys = set()
@@ -249,6 +254,8 @@ def validate_motion(
         place_keys.add(key)
 
     active_objects: set[str] = set()
+    if initial_carried_object_id is not None:
+        active_objects.add(str(initial_carried_object_id))
     picks_by_waypoint: dict[int, list[str]] = {}
     places_by_waypoint: dict[int, list[str]] = {}
     for event in pick_events:
@@ -266,6 +273,7 @@ def validate_motion(
         active_objects.update(current_picks)
         if len(active_objects) > 1:
             raise ValueError("only one object may be carried at a time")
+    final_carried_object_id = next(iter(active_objects), None) if active_objects else None
 
     display_times, display_samples, segment_durations = interpolate_trajectory(
         waypoints, speed_limits, sample_dt, segment_speed_limits
@@ -319,7 +327,7 @@ def validate_motion(
         ]
         start_vertices = envelope_vertices[0]
         end_vertices = envelope_vertices[-1]
-        active_object_id = active_object_for_segment(picks_by_waypoint, {}, segment)
+        active_object_id = active_object_for_segment(picks_by_waypoint, {}, segment, initial_carried_object_id)
 
         for joint in range(dof):
             low = min(float(start_angles[joint]), float(end_angles[joint]))
@@ -421,7 +429,9 @@ def validate_motion(
         segment = int(np.searchsorted(boundaries, time, side="right") - 1)
         segment = min(segment, max(0, len(segment_durations) - 1))
         vertices = forward_kinematics(angles, link_lengths)
-        active_object_id = active_object_for_segment(picks_by_waypoint, places_by_waypoint, segment)
+        active_object_id = active_object_for_segment(
+            picks_by_waypoint, places_by_waypoint, segment, initial_carried_object_id
+        )
         object_position = None
         if active_object_id is not None:
             object_position = carried_object_pose(vertices, angles, objects_by_id[active_object_id])
@@ -449,6 +459,14 @@ def validate_motion(
     return {
         "valid": not hazards,
         "duration": float(display_times[-1]),
+        "start_state": {
+            "joint_angles": [float(value) for value in points[0]],
+            "carried_object_id": None if initial_carried_object_id is None else str(initial_carried_object_id),
+        },
+        "end_state": {
+            "joint_angles": [float(value) for value in points[-1]],
+            "carried_object_id": final_carried_object_id,
+        },
         "segment_durations": [float(value) for value in segment_durations],
         "frames": frames,
         "planned_events": planned_events,

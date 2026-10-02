@@ -1,4 +1,4 @@
-import type { Project, SavedProject, ValidationResult } from "./types";
+import type { Project, SavedProject, SavedTask, TaskDefinition, TaskResult, ValidationResult } from "./types";
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -41,3 +41,25 @@ export const listProjects = () => request<SavedProject[]>("/api/projects");
 export const getProject = (id: string) => request<SavedProject>(`/api/projects/${id}`);
 
 export const replayProject = (id: string) => request<ValidationResult>(`/api/projects/${id}/replay`);
+
+export const validateTask = (task: TaskDefinition, previous: unknown | null) =>
+  request<TaskResult>("/api/task/validate", {
+    method: "POST",
+    body: JSON.stringify({ task, previous }),
+  });
+
+export const saveTask = (task: TaskDefinition) =>
+  request<SavedTask>("/api/tasks", {
+    method: "POST",
+    body: JSON.stringify(task),
+  });
+
+export const updateTask = (id: string, task: TaskDefinition) =>
+  request<SavedTask>(`/api/tasks/${id}`, {
+    method: "PUT",
+    body: JSON.stringify(task),
+  });
+
+export const listTasks = () => request<SavedTask[]>("/api/tasks");
+
+export const getTask = (id: string) => request<SavedTask>(`/api/tasks/${id}`);

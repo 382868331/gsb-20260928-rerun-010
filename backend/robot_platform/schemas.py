@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -56,3 +58,37 @@ class ValidationRequest(BaseModel):
     project: Project
     reviewed_segments: list[int] = []
     previous_validation_digest: str | None = None
+
+
+class TaskSegment(BaseModel):
+    segment_id: str
+    name: str = "segment"
+    operation: Project
+
+
+class FailureSpec(BaseModel):
+    segment_index: int = Field(ge=0)
+    type: Literal["pick_failed", "early_release"]
+    object_id: str
+    waypoint_index: int | None = None
+
+
+class TaskDefinition(BaseModel):
+    name: str = "chained-task"
+    segments: list[TaskSegment] = []
+    failures: list[FailureSpec] = []
+    handover_tolerance: float = Field(default=1e-6, ge=0)
+    constraint_version: str = "1.1"
+
+
+class SavedTask(TaskDefinition):
+    id: str
+    executable: bool = False
+    validation_digest: str = ""
+    last_task_validation: dict | None = None
+    validation_error: str | None = None
+
+
+class TaskValidationRequest(BaseModel):
+    task: TaskDefinition
+    previous: dict | None = None

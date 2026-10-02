@@ -103,3 +103,128 @@ export type SavedProject = Project & {
   last_validation: ValidationResult | null;
   validation_error: string | null;
 };
+
+export type TaskSegment = {
+  segment_id: string;
+  name: string;
+  operation: Project;
+};
+
+export type FailureSpec = {
+  segment_index: number;
+  type: "pick_failed" | "early_release";
+  object_id: string;
+  waypoint_index?: number | null;
+};
+
+export type TaskDefinition = {
+  name: string;
+  segments: TaskSegment[];
+  failures: FailureSpec[];
+  handover_tolerance: number;
+  constraint_version: string;
+};
+
+export type TaskFrame = Frame & {
+  segment: number;
+  local_time: number;
+};
+
+export type TaskHazard = {
+  start_time: number;
+  end_time: number;
+  segment: number;
+  inner_segment: number | null;
+  kind: string;
+  message: string;
+  confidence: string;
+};
+
+export type HandoverState = {
+  joint_angles: number[];
+  carried_object_id: string | null;
+};
+
+export type TaskSegmentResult = {
+  segment_id: string;
+  name: string;
+  digest: string;
+  start_time: number;
+  end_time: number;
+  handover_in: HandoverState;
+  handover_out: HandoverState | null;
+  valid: boolean;
+  error: string | null;
+  report: ValidationResult | null;
+};
+
+export type CarriedRange = {
+  object_id: string;
+  segment_index: number;
+  start_time: number;
+  end_time: number;
+};
+
+export type UnknownInterval = {
+  start_time: number;
+  end_time: number;
+  segment: number;
+  kind: string;
+  message: string;
+  confidence: string;
+};
+
+export type TaskReplayWindow = {
+  start_time: number;
+  end_time: number;
+  segment: number;
+  crosses_boundary: boolean;
+  boundaries: number[];
+};
+
+export type TaskPlanResult = {
+  valid: boolean;
+  duration: number;
+  segments: Omit<TaskSegmentResult, "report">[];
+  hazards: TaskHazard[];
+  first_hazard: TaskHazard | null;
+  frames: TaskFrame[];
+  carried_ranges: CarriedRange[];
+  replay_window: TaskReplayWindow | null;
+};
+
+export type TaskResult = {
+  valid: boolean;
+  duration: number;
+  constraint_version: string;
+  handover_tolerance: number;
+  segments: TaskSegmentResult[];
+  hazards: TaskHazard[];
+  first_hazard: TaskHazard | null;
+  replay_window: TaskReplayWindow | null;
+  frames: TaskFrame[];
+  carried_ranges: CarriedRange[];
+  boundaries: number[];
+  stale_segments: { segment: number; reason: string }[];
+  recheck_required: number[];
+  conclusion_sources: unknown;
+  abnormal: TaskPlanResult | null;
+  unknown_intervals: UnknownInterval[];
+  comparison: {
+    normal_first_hazard: TaskHazard | null;
+    abnormal_first_hazard: TaskHazard | null;
+    first_unknown: UnknownInterval | null;
+    first_concern_time: number | null;
+    first_concern_source: "normal" | "abnormal" | "unknown" | null;
+    first_concern: TaskHazard | UnknownInterval | null;
+  };
+  collision_check_dt: number;
+};
+
+export type SavedTask = TaskDefinition & {
+  id: string;
+  executable: boolean;
+  validation_digest: string;
+  last_task_validation: TaskResult | null;
+  validation_error: string | null;
+};
