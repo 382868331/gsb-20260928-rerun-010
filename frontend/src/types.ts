@@ -138,6 +138,7 @@ export type TaskHazard = {
   kind: string;
   message: string;
   confidence: string;
+  detail?: Record<string, unknown>;
 };
 
 export type HandoverState = {
@@ -153,9 +154,38 @@ export type TaskSegmentResult = {
   end_time: number;
   handover_in: HandoverState;
   handover_out: HandoverState | null;
+  status?: "proven" | "violated" | "unknown";
   valid: boolean;
   error: string | null;
   report: ValidationResult | null;
+  entry_velocity?: number[] | null;
+  exit_velocity?: number[] | null;
+};
+
+export type SeamJointCheck = {
+  joint: number;
+  from_velocity: number;
+  to_velocity: number;
+  velocity_change: number;
+  required_transition_time: number;
+  allowed_transition_time: number;
+  acceleration_limit: number;
+  ok: boolean;
+};
+
+export type SeamCheck = {
+  between_segments: number[];
+  between_segment_ids: string[];
+  between_names?: string[];
+  boundary_time: number;
+  transition_window_start?: number;
+  transition_window_end?: number;
+  status: "proven" | "violated" | "unknown";
+  confidence: string;
+  carried_object_id: string | null;
+  joint_angles?: number[];
+  joints: SeamJointCheck[];
+  reason?: string;
 };
 
 export type CarriedRange = {
@@ -190,6 +220,8 @@ export type TaskPlanResult = {
   first_hazard: TaskHazard | null;
   frames: TaskFrame[];
   carried_ranges: CarriedRange[];
+  seam_checks: SeamCheck[];
+  unknown_segments: number[];
   replay_window: TaskReplayWindow | null;
 };
 
@@ -205,6 +237,8 @@ export type TaskResult = {
   frames: TaskFrame[];
   carried_ranges: CarriedRange[];
   boundaries: number[];
+  seam_checks: SeamCheck[];
+  unknown_segments: number[];
   stale_segments: { segment: number; reason: string }[];
   recheck_required: number[];
   conclusion_sources: unknown;

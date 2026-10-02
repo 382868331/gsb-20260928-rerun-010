@@ -179,3 +179,194 @@ def test_task_api_roundtrip_keeps_conclusion_sources(tmp_path, monkeypatch):
     assert revalidated["valid"] is True
     assert revalidated["stale_segments"] == []
 
+
+def _speed_step_task():
+    fast = dict(
+        BASE,
+        waypoints=[[0, 0, 0], [0.4, 0, 0]],
+        segment_speed_limits=[[1, 1, 1]],
+        acceleration_limits=[1, 1, 1],
+        velocity_transition_time=0.2,
+        speed_limits=[1, 1, 1],
+        pick_events=[],
+        place_events=[],
+    )
+    slow = dict(
+        BASE,
+        waypoints=[[0.4, 0, 0], [0.45, 0, 0]],
+        segment_speed_limits=[[0.05, 1, 1]],
+        acceleration_limits=[1, 1, 1],
+        velocity_transition_time=0.2,
+        speed_limits=[1, 1, 1],
+        pick_events=[],
+        place_events=[],
+    )
+    return {
+        "name": "speed-step",
+        "segments": [
+            {"segment_id": "fast", "name": "fast", "operation": fast},
+            {"segment_id": "slow", "name": "slow", "operation": slow},
+        ],
+    }
+
+
+def test_cross_segment_speed_step_is_rejected_at_seam():
+    result = validate_task(_speed_step_task())
+
+    assert result["valid"] is False
+    seam_hazards = [item for item in result["hazards"] if item["kind"] == "velocity_transition"]
+    assert len(seam_hazards) == 1
+    hazard = seam_hazards[0]
+    assert hazard["segment"] == 1
+    assert hazard["start_time"] == result["boundaries"][0] == 0.4
+    detail = hazard["detail"]
+    assert detail["joint"] == 1
+    assert detail["from_velocity"] == 1.0
+    assert detail["to_velocity"] == 0.05
+    assert 0.94 < detail["required_transition_time"] < 0.96
+    assert detail["allowed_transition_time"] == 0.2
+    assert detail["acceleration_limit"] == 1.0
+    assert abs(detail["transition_window_start"] - 0.2) < 1e-9
+    assert abs(detail["transition_window_end"] - 0.6) < 1e-9
+    assert "fast" in hazard["message"] and "slow" in hazard["message"]
+    seam = result["seam_checks"][0]
+    assert seam["status"] == "violated"
+    assert seam["between_segment_ids"] == ["fast", "slow"]
+
+
+def test_smooth_seam_is_explicitly_proven():
+    result = validate_task(make_task())
+
+    assert result["valid"] is True
+    assert result["unknown_segments"] == []
+    seam = result["seam_checks"][0]
+    assert seam["status"] == "proven"
+    assert seam["carried_object_id"] == "block"
+    assert all(item["ok"] for item in seam["joints"])
+
+
+def test_zero_length_action_at_boundary_provides_no_transition_time():
+    task = _speed_step_task()
+    task["segments"].insert(1, {
+        "segment_id": "pause",
+        "name": "zero-length pause",
+        "operation": dict(
+            BASE,
+            waypoints=[[0.4, 0, 0], [0.4, 0, 0]],
+            acceleration_limits=[1, 1, 1],
+            velocity_transition_time=0.2,
+            speed_limits=[1, 1, 1],
+            pick_events=[],
+            place_events=[],
+        ),
+    })
+    result = validate_task(task)
+
+    assert result["valid"] is False
+    violated = [seam for seam in result["seam_checks"] if seam["status"] == "violated"]
+    assert any(seam["between_segment_ids"] == ["fast", "pause"] for seam in violated)
+    assert any(seam["between_segment_ids"] == ["pause", "slow"] and seam["status"] == "proven" for seam in result["seam_checks"])
+
+
+def test_splitting_one_trajectory_does_not_add_transition_budget():
+    operation = dict(
+        BASE,
+        waypoints=[[0, 0, 0], [0.4, 0, 0], [0.45, 0, 0]],
+        segment_speed_limits=[[1, 1, 1], [0.05, 1, 1]],
+        acceleration_limits=[1, 1, 1],
+        velocity_transition_time=0.2,
+        speed_limits=[1, 1, 1],
+        pick_events=[],
+        place_events=[],
+    )
+    whole = validate_motion(
+        operation["waypoints"],
+        operation["speed_limits"],
+        [tuple(pair) for pair in BASE["joint_limits"]],
+        BASE["link_lengths"],
+        [],
+        segment_speed_limits=operation["segment_speed_limits"],
+        acceleration_limits=[1, 1, 1],
+        velocity_transition_time=0.2,
+    )
+    assert whole["valid"] is False
+
+    split = {
+        "name": "split",
+        "segments": [
+            {"segment_id": "a", "name": "a", "operation": {
+                **operation,
+                "waypoints": [[0, 0, 0], [0.4, 0, 0]],
+                "segment_speed_limits": [[1, 1, 1]],
+            }},
+            {"segment_id": "b", "name": "b", "operation": {
+                **operation,
+                "waypoints": [[0.4, 0, 0], [0.45, 0, 0]],
+                "segment_speed_limits": [[0.05, 1, 1]],
+            }},
+        ],
+    }
+    result = validate_task(split)
+    assert result["valid"] is False
+    assert result["seam_checks"][0]["status"] == "violated"
+
+
+def test_continuous_in_place_rotation_seam_is_checked():
+    first = dict(
+        BASE,
+        waypoints=[[0, 0, 0], [0.4, 0, 0]],
+        acceleration_limits=[1, 1, 1],
+        velocity_transition_time=0.2,
+        speed_limits=[1, 1, 1],
+        pick_events=[],
+        place_events=[],
+    )
+    rotate = dict(
+        BASE,
+        waypoints=[[0.4, 0, 0], [0.4, 0.3, 0]],
+        acceleration_limits=[1, 1, 1],
+        velocity_transition_time=0.2,
+        speed_limits=[1, 1, 1],
+        pick_events=[],
+        place_events=[],
+    )
+    result = validate_task({
+        "name": "rotation",
+        "segments": [
+            {"segment_id": "move", "name": "move", "operation": first},
+            {"segment_id": "turn", "name": "turn", "operation": rotate},
+        ],
+    })
+
+    seam = result["seam_checks"][0]
+    assert seam["status"] == "violated"
+    joint_statuses = {item["joint"]: item["ok"] for item in seam["joints"]}
+    assert joint_statuses[1] is False
+    assert joint_statuses[2] is False
+
+
+def test_missing_required_state_marks_later_segments_unknown():
+    task = make_task()
+    task["segments"][1]["operation"]["carried_objects"] = []
+    task["segments"][1]["operation"]["place_events"] = []
+    result = validate_task(task)
+
+    assert result["valid"] is False
+    assert result["unknown_segments"] == [1]
+    assert result["segments"][1]["status"] == "unknown"
+    assert result["segments"][0]["status"] == "proven"
+    assert result["seam_checks"][0]["status"] == "unknown"
+
+
+def test_speed_change_in_middle_segment_invalidates_downstream_seam_conclusion():
+    original = validate_task(_speed_step_task())
+    sources = original["conclusion_sources"]
+    assert sources["segments"][0]["exit_velocity"] == [1.0, 0.0, 0.0]
+    assert sources["segments"][1]["entry_velocity"] == [0.05, 0.0, 0.0]
+
+    slower_first = _speed_step_task()
+    slower_first["segments"][0]["operation"]["segment_speed_limits"] = [[0.25, 1, 1]]
+    result = validate_task(slower_first, previous=sources)
+    assert {item["segment"] for item in result["stale_segments"]} == {0, 1}
+    assert result["valid"] is True
+    assert result["seam_checks"][0]["status"] == "proven"

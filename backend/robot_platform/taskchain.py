@@ -4,7 +4,9 @@ import copy
 import hashlib
 import json
 
-from .robotics import COLLISION_CHECK_DT, validate_motion
+import numpy as np
+
+from .robotics import COLLISION_CHECK_DT, segment_velocities, validate_motion
 
 DEFAULT_HANDOVER_TOLERANCE = 1e-6
 REPLAY_PAD = 0.02
@@ -31,6 +33,24 @@ def _segment_validation_kwargs(operation: dict) -> dict:
         "place_events": operation.get("place_events", []),
         "constraint_version": operation.get("constraint_version", "1.1"),
     }
+
+
+def _segment_constraints(operation: dict, dof: int) -> tuple[np.ndarray, float]:
+    speed_limits = np.asarray(operation["speed_limits"], dtype=float)
+    if operation.get("acceleration_limits") is not None:
+        acceleration = np.asarray(operation["acceleration_limits"], dtype=float)
+    else:
+        acceleration = np.maximum(2.0, speed_limits)
+    transition_time = float(operation.get("velocity_transition_time", 0.2))
+    if acceleration.shape != (dof,):
+        raise ValueError("acceleration_limits must contain one value per joint")
+    return acceleration, transition_time
+
+
+def _operation_velocities(operation: dict, report: dict) -> list[np.ndarray]:
+    points = [np.asarray(values, dtype=float) for values in operation["waypoints"]]
+    durations = [float(value) for value in report["segment_durations"]]
+    return segment_velocities(points, durations)
 
 
 def _run_segment(operation: dict, initial_carried: str | None) -> dict:
@@ -120,6 +140,7 @@ def _run_chain(segments: list[dict], handover_tolerance: float) -> dict:
     hazards: list[dict] = []
     frames: list[dict] = []
     carried_ranges: list[dict] = []
+    seam_checks: list[dict] = []
     boundaries: list[float] = []
     offset = 0.0
     initial: str | None = None
@@ -140,7 +161,21 @@ def _run_chain(segments: list[dict], handover_tolerance: float) -> dict:
             report = None
             error = str(exc)
 
+        name = segment.get("name", segment.get("segment_id", f"segment-{index + 1}"))
+        segment_id = segment.get("segment_id", f"segment-{index + 1}")
+
         if report is None:
+            if per_segment:
+                seam_checks.append({
+                    "between_segments": [index - 1, index],
+                    "between_segment_ids": [per_segment[-1]["segment_id"], segment_id],
+                    "boundary_time": offset,
+                    "status": "unknown",
+                    "confidence": "unknown",
+                    "carried_object_id": initial,
+                    "reason": f"segment {name} cannot start from the handed-over state: {error}",
+                    "joints": [],
+                })
             hazards.append({
                 "start_time": offset,
                 "end_time": offset,
@@ -151,19 +186,110 @@ def _run_chain(segments: list[dict], handover_tolerance: float) -> dict:
                 "confidence": "boundary",
             })
             per_segment.append({
-                "segment_id": segment.get("segment_id", f"segment-{index + 1}"),
-                "name": segment.get("name", f"segment-{index + 1}"),
+                "segment_id": segment_id,
+                "name": name,
                 "digest": digest,
                 "start_time": offset,
                 "end_time": offset,
                 "handover_in": handover_in,
                 "handover_out": None,
+                "status": "unknown",
                 "valid": False,
                 "error": error,
                 "report": None,
+                "entry_velocity": None,
+                "exit_velocity": None,
             })
             boundaries.append(offset)
             break
+
+        dof = len(operation["link_lengths"])
+        acceleration, transition_time = _segment_constraints(operation, dof)
+        velocities = _operation_velocities(operation, report)
+        entry_velocity = velocities[0]
+        exit_velocity = velocities[-1]
+
+        entry_state = {
+            "joint_angles": handover_in["joint_angles"],
+            "carried_object_id": initial,
+            "entry_velocity": [float(value) for value in entry_velocity],
+        }
+
+        if per_segment and per_segment[-1]["report"] is not None:
+            previous = per_segment[-1]
+            previous_operation = segments[index - 1]["operation"]
+            previous_acceleration, previous_transition_time = _segment_constraints(
+                previous_operation, dof
+            )
+            seam_acceleration = np.minimum(previous_acceleration, acceleration)
+            seam_transition_time = min(previous_transition_time, transition_time)
+            from_velocity = np.asarray(previous["exit_velocity"], dtype=float)
+            joint_results = []
+            violated_joints = []
+            for joint in range(dof):
+                velocity_change = abs(float(entry_velocity[joint] - from_velocity[joint]))
+                allowed_change = float(seam_acceleration[joint]) * seam_transition_time
+                required_time = (
+                    velocity_change / float(seam_acceleration[joint])
+                    if float(seam_acceleration[joint]) > 0
+                    else float("inf")
+                )
+                joint_ok = velocity_change <= allowed_change + 1e-9
+                joint_results.append({
+                    "joint": joint + 1,
+                    "from_velocity": float(from_velocity[joint]),
+                    "to_velocity": float(entry_velocity[joint]),
+                    "velocity_change": velocity_change,
+                    "required_transition_time": required_time,
+                    "allowed_transition_time": seam_transition_time,
+                    "acceleration_limit": float(seam_acceleration[joint]),
+                    "ok": joint_ok,
+                })
+                if not joint_ok:
+                    violated_joints.append((joint, velocity_change, required_time))
+            seam_status = "violated" if violated_joints else "proven"
+            seam_info = {
+                "between_segments": [index - 1, index],
+                "between_segment_ids": [previous["segment_id"], segment_id],
+                "between_names": [previous["name"], name],
+                "boundary_time": offset,
+                "transition_window_start": offset - seam_transition_time,
+                "transition_window_end": offset + seam_transition_time,
+                "status": seam_status,
+                "confidence": "boundary",
+                "carried_object_id": initial,
+                "joint_angles": handover_in["joint_angles"],
+                "joints": joint_results,
+            }
+            seam_checks.append(seam_info)
+            for joint, velocity_change, required_time in violated_joints:
+                hazards.append({
+                    "start_time": offset,
+                    "end_time": offset,
+                    "segment": index,
+                    "inner_segment": None,
+                    "kind": "velocity_transition",
+                    "message": (
+                        f"joint {joint + 1} velocity changes {velocity_change:.3f} rad/s between "
+                        f"segments {index} ('{previous['name']}') and {index + 1} ('{name}') at t={offset:.3f}s; "
+                        f"requires {required_time:.3f}s but only {seam_transition_time:.3f}s transition is allowed "
+                        f"(acceleration limit {float(seam_acceleration[joint]):.3f} rad/s^2; "
+                        f"carried object: {initial if initial is not None else 'none'})"
+                    ),
+                    "confidence": "boundary",
+                    "detail": {
+                        "joint": joint + 1,
+                        "from_velocity": float(from_velocity[joint]),
+                        "to_velocity": float(entry_velocity[joint]),
+                        "velocity_change": velocity_change,
+                        "required_transition_time": required_time,
+                        "allowed_transition_time": seam_transition_time,
+                        "acceleration_limit": float(seam_acceleration[joint]),
+                        "transition_window_start": offset - seam_transition_time,
+                        "transition_window_end": offset + seam_transition_time,
+                        "carried_object_id": initial,
+                    },
+                })
 
         if previous_end_angles is not None:
             mismatch = max(
@@ -217,29 +343,43 @@ def _run_chain(segments: list[dict], handover_tolerance: float) -> dict:
         previous_end_angles = handover_out["joint_angles"]
         initial = handover_out["carried_object_id"]
         per_segment.append({
-            "segment_id": segment.get("segment_id", f"segment-{index + 1}"),
-            "name": segment.get("name", f"segment-{index + 1}"),
+            "segment_id": segment_id,
+            "name": name,
             "digest": digest,
             "start_time": offset,
             "end_time": offset + duration,
-            "handover_in": handover_in,
+            "handover_in": entry_state,
             "handover_out": handover_out,
+            "status": "proven" if report["valid"] else "violated",
             "valid": bool(report["valid"]),
             "error": None,
             "report": report,
+            "entry_velocity": [float(value) for value in entry_velocity],
+            "exit_velocity": [float(value) for value in exit_velocity],
         })
         offset += duration
         boundaries.append(offset)
 
     hazards.sort(key=lambda item: (item["start_time"], item["end_time"], item["kind"]))
+    unknown_segments = [
+        index for index, item in enumerate(per_segment)
+        if item["status"] == "unknown" or item["report"] is None
+    ]
     return {
         "segments": per_segment,
         "hazards": hazards,
         "frames": frames,
         "carried_ranges": carried_ranges,
+        "seam_checks": seam_checks,
         "boundaries": boundaries,
         "duration": offset,
-        "valid": not hazards and all(item["valid"] for item in per_segment) and len(per_segment) == len(segments),
+        "unknown_segments": unknown_segments,
+        "valid": (
+            not hazards
+            and not unknown_segments
+            and all(item["valid"] for item in per_segment)
+            and len(per_segment) == len(segments)
+        ),
     }
 
 
@@ -271,14 +411,17 @@ def _stale_segments(current: list[dict], previous: dict | None) -> list[dict]:
             stale.append({"segment": index, "reason": "new segment without a previous conclusion"})
             continue
         before = previous_segments[index]
+        reason = None
         if before.get("segment_id") != segment["segment_id"]:
-            stale.append({"segment": index, "reason": "segment was replaced"})
-            continue
-        if before.get("digest") != segment["digest"]:
-            stale.append({"segment": index, "reason": "operation version changed"})
-            continue
-        if before.get("handover_in") != segment["handover_in"]:
-            stale.append({"segment": index, "reason": "handover-in condition changed"})
+            reason = "segment was replaced"
+        elif before.get("digest") != segment["digest"]:
+            reason = "operation version changed"
+        elif before.get("handover_in") != segment["handover_in"]:
+            reason = "handover-in condition changed"
+        elif index > 0 and any(item["segment"] == index - 1 for item in stale):
+            reason = "predecessor entry state changed; seam conclusion must be rechecked"
+        if reason is not None:
+            stale.append({"segment": index, "reason": reason})
     return stale
 
 
@@ -291,6 +434,8 @@ def _conclusion_sources(per_segment: list[dict], constraint_version: str) -> dic
                 "digest": item["digest"],
                 "handover_in": item["handover_in"],
                 "handover_out": item["handover_out"],
+                "entry_velocity": item["entry_velocity"],
+                "exit_velocity": item["exit_velocity"],
             }
             for item in per_segment
         ],
@@ -363,6 +508,8 @@ def validate_task(
             "first_hazard": abnormal_first,
             "frames": abnormal_chain["frames"],
             "carried_ranges": abnormal_chain["carried_ranges"],
+            "seam_checks": abnormal_chain["seam_checks"],
+            "unknown_segments": abnormal_chain["unknown_segments"],
             "replay_window": (
                 None if abnormal_first is None else _replay_window(abnormal_first, abnormal_chain["boundaries"], abnormal_chain["duration"])
             ),
@@ -390,6 +537,8 @@ def validate_task(
         "frames": normal["frames"],
         "carried_ranges": normal["carried_ranges"],
         "boundaries": normal["boundaries"],
+        "seam_checks": normal["seam_checks"],
+        "unknown_segments": normal["unknown_segments"],
         "stale_segments": stale,
         "recheck_required": [item["segment"] for item in stale],
         "conclusion_sources": _conclusion_sources(normal["segments"], constraint_version),
