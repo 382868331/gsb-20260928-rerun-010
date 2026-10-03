@@ -23,6 +23,11 @@ class CarryEvent(BaseModel):
     object_id: str
 
 
+class WaitEvent(BaseModel):
+    waypoint_index: int = Field(ge=0)
+    duration: float = Field(ge=0)
+
+
 class Project(BaseModel):
     name: str = "untitled"
     waypoints: list[list[float]]
@@ -33,6 +38,9 @@ class Project(BaseModel):
     carried_objects: list[CarriedObject] = []
     pick_events: list[CarryEvent] = []
     place_events: list[CarryEvent] = []
+    wait_events: list[WaitEvent] = []
+    wait_before: float = Field(default=0.0, ge=0)
+    wait_after: float = Field(default=0.0, ge=0)
     segment_speed_limits: list[list[float]] | None = None
     acceleration_limits: list[float] | None = None
     velocity_transition_time: float = Field(default=0.2, gt=0)
@@ -63,7 +71,8 @@ class ValidationRequest(BaseModel):
 class TaskSegment(BaseModel):
     segment_id: str
     name: str = "segment"
-    operation: Project
+    operation: Project | None = None
+    wait: float | None = Field(default=None, ge=0)
 
 
 class FailureSpec(BaseModel):

@@ -53,6 +53,7 @@ export default function App() {
   const [abnormalView, setAbnormalView] = useState(false);
   const [savedTasks, setSavedTasks] = useState<SavedTask[]>([]);
   const [currentTaskId, setCurrentTaskId] = useState<string | null>(null);
+  const [waitDraft, setWaitDraft] = useState(0.5);
 
   const activeTaskPlan = taskMode && taskResult ? (abnormalView && taskResult.abnormal ? taskResult.abnormal : taskResult) : null;
   const viewFrames: Frame[] = activeTaskPlan ? activeTaskPlan.frames : result?.frames ?? [];
@@ -290,7 +291,7 @@ export default function App() {
 
   const taskObjectOptions = useMemo(() => {
     const byId = new Map<string, string>();
-    task.segments.forEach((segment) => segment.operation.carried_objects.forEach((item) => byId.set(item.id, item.name)));
+    task.segments.forEach((segment) => segment.operation?.carried_objects.forEach((item) => byId.set(item.id, item.name)));
     return Array.from(byId, ([id, name]) => ({ id, name }));
   }, [task.segments]);
 
@@ -430,6 +431,16 @@ export default function App() {
           <label className="single-input">允许过渡时间 s
             <NumberInput value={project.velocity_transition_time} step={0.02} onChange={(next) => {
               setProject({ ...project, velocity_transition_time: next });
+            }} />
+          </label>
+          <label className="single-input">段前等待 s
+            <NumberInput value={project.wait_before} step={0.05} onChange={(next) => {
+              setProject({ ...project, wait_before: Math.max(0, next) });
+            }} />
+          </label>
+          <label className="single-input">段后等待 s
+            <NumberInput value={project.wait_after} step={0.05} onChange={(next) => {
+              setProject({ ...project, wait_after: Math.max(0, next) });
             }} />
           </label>
           {project.acceleration_limits?.map((value, index) => (
@@ -582,6 +593,26 @@ export default function App() {
             const handoverHazard = taskResult?.hazards.find(
               (hazard) => hazard.segment === index && hazard.kind.startsWith("handover"),
             );
+            if (segment.operation == null) {
+              return (
+                <div className="limit-row" key={segment.segment_id}>
+                  <span>
+                    段{index + 1} 等待
+                    {segmentResult ? (segmentResult.valid ? "·已计时" : "·状态不足") : "·未校验"}
+                    {stale ? "·需复核" : ""}
+                  </span>
+                  <NumberInput value={segment.wait ?? 0} step={0.05} onChange={(next) => {
+                    setTask((current) => ({
+                      ...current,
+                      segments: current.segments.map((item, itemIndex) =>
+                        itemIndex === index ? { ...item, wait: Math.max(0, next) } : item,
+                      ),
+                    }));
+                  }} />
+                  <button className="icon" onClick={() => removeTaskSegment(index)}>×</button>
+                </div>
+              );
+            }
             return (
               <div className="limit-row" key={segment.segment_id}>
                 <span>
@@ -596,9 +627,46 @@ export default function App() {
             );
           })}
           <button onClick={addTaskSegment}>加入当前工程为一段</button>
+          <div className="limit-row">
+            <span>等待时长 s</span>
+            <NumberInput value={waitDraft} step={0.05} onChange={(next) => setWaitDraft(Math.max(0, next))} />
+            <button onClick={() => {
+              setTask((current) => ({
+                ...current,
+                segments: [
+                  ...current.segments,
+                  {
+                    segment_id: "wait-" + Date.now() + "-" + current.segments.length,
+                    name: "等待 " + waitDraft.toFixed(2) + "s",
+                    operation: null,
+                    wait: waitDraft,
+                  },
+                ],
+              }));
+            }}>加入等待段</button>
+          </div>
           <button className="primary" onClick={() => runTaskValidation()} disabled={task.segments.length < 2}>
             校验完整任务
           </button>
+          {taskResult && taskResult.seam_checks.length > 0 && (
+            <div className="message">
+              接缝：
+              {taskResult.seam_checks
+                .map((seam) => {
+                  const names = seam.between_names ?? seam.between_segment_ids;
+                  const worst = seam.joints.reduce(
+                    (acc, joint) => Math.max(acc, joint.required_transition_time),
+                    0,
+                  );
+                  const allowed = seam.joints[0]?.allowed_transition_time;
+                  return (names?.[0] ?? "?") + "→" + (names?.[1] ?? "?") + " " +
+                    (seam.status === "proven" ? "已证实" : seam.status === "violated" ? "违反" : "未知") +
+                    "（等待 " + (seam.wait_duration ?? 0).toFixed(2) + "s，需 " + worst.toFixed(2) + "s" +
+                    (allowed != null ? "/允许 " + allowed.toFixed(2) + "s" : "") + "）";
+                })
+                .join("；")}
+            </div>
+          )}
           {taskResult && (
             <div className="message">
               实际携带：

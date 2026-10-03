@@ -30,6 +30,7 @@ def project_validation_kwargs(project: Project) -> dict:
         "carried_objects": [item.model_dump() for item in project.carried_objects],
         "pick_events": [item.model_dump() for item in project.pick_events],
         "place_events": [item.model_dump() for item in project.place_events],
+        "wait_events": [item.model_dump() for item in project.wait_events],
         "constraint_version": project.constraint_version,
         "reviewed_segments": project.reviewed_segments,
         "previous_validation_digest": project.previous_validation_digest,

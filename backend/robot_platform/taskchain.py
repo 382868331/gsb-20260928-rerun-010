@@ -6,7 +6,7 @@ import json
 
 import numpy as np
 
-from .robotics import COLLISION_CHECK_DT, segment_velocities, validate_motion
+from .robotics import COLLISION_CHECK_DT, carried_object_pose, forward_kinematics, segment_velocities, validate_motion
 
 DEFAULT_HANDOVER_TOLERANCE = 1e-6
 REPLAY_PAD = 0.02
@@ -94,13 +94,90 @@ def _carried_ranges_for_segment(report: dict, offset: float, segment_index: int,
     return ranges
 
 
+def _expand_segment_items(segment: dict) -> list[tuple[str, object]]:
+    operation = segment.get("operation")
+    wait_value = segment.get("wait")
+    if operation is None and wait_value is None:
+        raise ValueError("each task segment requires an operation or a wait duration")
+    if operation is None:
+        duration = float(wait_value)
+        if duration < 0:
+            raise ValueError("wait duration must be non-negative")
+        return [("wait", duration)]
+    wait_before = float(operation.get("wait_before", 0.0))
+    wait_after = float(operation.get("wait_after", 0.0))
+    if wait_before < 0 or wait_after < 0:
+        raise ValueError("wait durations must be non-negative")
+    items: list[tuple[str, object]] = []
+    if wait_before > 0:
+        items.append(("wait", wait_before))
+    items.append(("motion", operation))
+    if wait_after > 0:
+        items.append(("wait", wait_after))
+    return items
+
+
+def _hold_frames(
+    angles: list[float],
+    link_lengths: list[float],
+    carried_id: str | None,
+    objects_by_id: dict,
+    start: float,
+    duration: float,
+    sample_dt: float,
+    segment_index: int,
+) -> list[dict]:
+    if duration <= 0:
+        return []
+    vertices = forward_kinematics(np.asarray(angles, dtype=float), link_lengths)
+    object_position = None
+    if carried_id is not None and carried_id in objects_by_id:
+        object_position = carried_object_pose(vertices, np.asarray(angles, dtype=float), objects_by_id[carried_id])
+    count = max(1, int(np.floor(duration / sample_dt + 1e-9)))
+    frames = []
+    for step in range(count + 1):
+        time_value = min(start + step * sample_dt, start + duration)
+        frames.append({
+            "time": float(time_value),
+            "local_time": float(time_value - start),
+            "segment": segment_index,
+            "joint_angles": [float(value) for value in angles],
+            "links": [[float(x), float(y)] for x, y in vertices],
+            "carried_object_id": carried_id,
+            "object_position": None if object_position is None else [float(object_position[0]), float(object_position[1])],
+        })
+    return frames
+
+
+def _merge_carried_ranges(ranges: list[dict], wait_intervals: list[tuple[float, float]]) -> list[dict]:
+    merged: list[dict] = []
+    for item in sorted(ranges, key=lambda entry: (entry["start_time"], entry["object_id"])):
+        if merged and merged[-1]["object_id"] == item["object_id"]:
+            gap_start = merged[-1]["end_time"]
+            gap_end = item["start_time"]
+            gap = gap_end - gap_start
+            if gap <= 1e-9:
+                merged[-1]["end_time"] = max(merged[-1]["end_time"], item["end_time"])
+                continue
+            covered = 0.0
+            for wait_start, wait_end in wait_intervals:
+                covered += max(0.0, min(gap_end, wait_end) - max(gap_start, wait_start))
+            if covered >= gap - 1e-9:
+                merged[-1]["end_time"] = max(merged[-1]["end_time"], item["end_time"])
+                continue
+        merged.append(dict(item))
+    return merged
+
+
 def _apply_failures(segments: list[dict], failures: list[dict]) -> list[dict]:
     transformed = copy.deepcopy(segments)
     for failure in failures:
         index = int(failure["segment_index"])
         if not 0 <= index < len(transformed):
             raise ValueError("failure segment_index is out of range")
-        operation = transformed[index]["operation"]
+        operation = transformed[index].get("operation")
+        if operation is None:
+            raise ValueError("failure segment must reference a motion segment")
         object_id = str(failure["object_id"])
         if failure["type"] == "pick_failed":
             operation["pick_events"] = [
@@ -110,7 +187,9 @@ def _apply_failures(segments: list[dict], failures: list[dict]) -> list[dict]:
                 event for event in operation.get("place_events", []) if str(event["object_id"]) != object_id
             ]
             for later in transformed[index + 1:]:
-                later_operation = later["operation"]
+                later_operation = later.get("operation")
+                if later_operation is None:
+                    continue
                 later_operation["place_events"] = [
                     event for event in later_operation.get("place_events", []) if str(event["object_id"]) != object_id
                 ]
@@ -126,7 +205,9 @@ def _apply_failures(segments: list[dict], failures: list[dict]) -> list[dict]:
             remaining.append({"waypoint_index": int(waypoint_index), "object_id": object_id})
             operation["place_events"] = remaining
             for later in transformed[index + 1:]:
-                later_operation = later["operation"]
+                later_operation = later.get("operation")
+                if later_operation is None:
+                    continue
                 later_operation["place_events"] = [
                     event for event in later_operation.get("place_events", []) if str(event["object_id"]) != object_id
                 ]
@@ -142,18 +223,111 @@ def _run_chain(segments: list[dict], handover_tolerance: float) -> dict:
     carried_ranges: list[dict] = []
     seam_checks: list[dict] = []
     boundaries: list[float] = []
+    wait_intervals: list[tuple[float, float]] = []
     offset = 0.0
     initial: str | None = None
-    previous_end_angles: list[float] | None = None
+    current_pose: list[float] | None = None
+    current_link_lengths: list[float] | None = None
+    pending_dwell = 0.0
+    last_sample_dt = 0.02
+    previous_motion: dict | None = None
+    objects_by_id: dict = {}
+    for segment in segments:
+        operation = segment.get("operation")
+        if operation:
+            for carried in operation.get("carried_objects", []):
+                objects_by_id[str(carried["id"])] = carried
 
     for index, segment in enumerate(segments):
-        operation = segment["operation"]
-        constraint_version = operation.get("constraint_version", "1.1")
-        digest = operation_digest(operation, initial, constraint_version)
+        name = segment.get("name", segment.get("segment_id", f"segment-{index + 1}"))
+        segment_id = segment.get("segment_id", f"segment-{index + 1}")
+        segment_start = offset
+        items = _expand_segment_items(segment)
+        operation = segment.get("operation")
+        constraint_version = (operation or {}).get("constraint_version", "1.1")
+        digest_payload = operation if operation is not None else {"wait": float(segment.get("wait", 0.0))}
+        digest = operation_digest(digest_payload, initial, constraint_version)
+
+        if operation is None:
+            wait_duration = float(segment.get("wait", 0.0))
+            handover_in = {
+                "joint_angles": None if current_pose is None else [float(value) for value in current_pose],
+                "carried_object_id": initial,
+            }
+            if current_pose is None:
+                hazards.append({
+                    "start_time": offset,
+                    "end_time": offset,
+                    "segment": index,
+                    "inner_segment": None,
+                    "kind": "handover_state",
+                    "message": f"wait segment {index + 1} has no preceding motion to hold its pose",
+                    "confidence": "boundary",
+                })
+                per_segment.append({
+                    "segment_id": segment_id,
+                    "name": name,
+                    "digest": digest,
+                    "start_time": segment_start,
+                    "end_time": offset,
+                    "handover_in": handover_in,
+                    "handover_out": None,
+                    "status": "unknown",
+                    "valid": False,
+                    "error": "wait segment requires a preceding motion segment",
+                    "report": None,
+                    "entry_velocity": None,
+                    "exit_velocity": None,
+                    "kind": "wait",
+                })
+                boundaries.append(offset)
+                break
+            frames.extend(
+                _hold_frames(current_pose, current_link_lengths, initial, objects_by_id, offset, wait_duration, last_sample_dt, index)
+            )
+            if wait_duration > 0:
+                wait_intervals.append((offset, offset + wait_duration))
+                pending_dwell += wait_duration
+                offset += wait_duration
+            per_segment.append({
+                "segment_id": segment_id,
+                "name": name,
+                "digest": digest,
+                "start_time": segment_start,
+                "end_time": offset,
+                "handover_in": handover_in,
+                "handover_out": {
+                    "joint_angles": [float(value) for value in current_pose],
+                    "carried_object_id": initial,
+                },
+                "status": "proven",
+                "valid": True,
+                "error": None,
+                "report": None,
+                "entry_velocity": None,
+                "exit_velocity": None,
+                "kind": "wait",
+                "wait_duration": wait_duration,
+            })
+            boundaries.append(offset)
+            continue
+
+        wait_before = float(operation.get("wait_before", 0.0))
+        wait_after = float(operation.get("wait_after", 0.0))
         handover_in = {
             "joint_angles": [float(value) for value in operation["waypoints"][0]],
             "carried_object_id": initial,
         }
+
+        if wait_before > 0:
+            hold_pose = current_pose if current_pose is not None else [float(value) for value in operation["waypoints"][0]]
+            frames.extend(
+                _hold_frames(hold_pose, operation["link_lengths"], initial, objects_by_id, offset, wait_before, float(operation.get("sample_dt", 0.02)), index)
+            )
+            wait_intervals.append((offset, offset + wait_before))
+            pending_dwell += wait_before
+            offset += wait_before
+
         try:
             report = _run_segment(operation, initial)
             error = None
@@ -161,14 +335,11 @@ def _run_chain(segments: list[dict], handover_tolerance: float) -> dict:
             report = None
             error = str(exc)
 
-        name = segment.get("name", segment.get("segment_id", f"segment-{index + 1}"))
-        segment_id = segment.get("segment_id", f"segment-{index + 1}")
-
         if report is None:
-            if per_segment:
+            if previous_motion is not None:
                 seam_checks.append({
                     "between_segments": [index - 1, index],
-                    "between_segment_ids": [per_segment[-1]["segment_id"], segment_id],
+                    "between_segment_ids": [previous_motion["segment_id"], segment_id],
                     "boundary_time": offset,
                     "status": "unknown",
                     "confidence": "unknown",
@@ -189,7 +360,7 @@ def _run_chain(segments: list[dict], handover_tolerance: float) -> dict:
                 "segment_id": segment_id,
                 "name": name,
                 "digest": digest,
-                "start_time": offset,
+                "start_time": segment_start,
                 "end_time": offset,
                 "handover_in": handover_in,
                 "handover_out": None,
@@ -199,6 +370,7 @@ def _run_chain(segments: list[dict], handover_tolerance: float) -> dict:
                 "report": None,
                 "entry_velocity": None,
                 "exit_velocity": None,
+                "kind": "motion",
             })
             boundaries.append(offset)
             break
@@ -208,6 +380,7 @@ def _run_chain(segments: list[dict], handover_tolerance: float) -> dict:
         velocities = _operation_velocities(operation, report)
         entry_velocity = velocities[0]
         exit_velocity = velocities[-1]
+        motion_start = offset
 
         entry_state = {
             "joint_angles": handover_in["joint_angles"],
@@ -215,20 +388,20 @@ def _run_chain(segments: list[dict], handover_tolerance: float) -> dict:
             "entry_velocity": [float(value) for value in entry_velocity],
         }
 
-        if per_segment and per_segment[-1]["report"] is not None:
-            previous = per_segment[-1]
-            previous_operation = segments[index - 1]["operation"]
+        if previous_motion is not None:
+            previous = previous_motion
             previous_acceleration, previous_transition_time = _segment_constraints(
-                previous_operation, dof
+                previous["operation"], dof
             )
             seam_acceleration = np.minimum(previous_acceleration, acceleration)
             seam_transition_time = min(previous_transition_time, transition_time)
+            allowed_transition = seam_transition_time + pending_dwell
             from_velocity = np.asarray(previous["exit_velocity"], dtype=float)
             joint_results = []
             violated_joints = []
             for joint in range(dof):
                 velocity_change = abs(float(entry_velocity[joint] - from_velocity[joint]))
-                allowed_change = float(seam_acceleration[joint]) * seam_transition_time
+                allowed_change = float(seam_acceleration[joint]) * allowed_transition
                 required_time = (
                     velocity_change / float(seam_acceleration[joint])
                     if float(seam_acceleration[joint]) > 0
@@ -241,7 +414,7 @@ def _run_chain(segments: list[dict], handover_tolerance: float) -> dict:
                     "to_velocity": float(entry_velocity[joint]),
                     "velocity_change": velocity_change,
                     "required_transition_time": required_time,
-                    "allowed_transition_time": seam_transition_time,
+                    "allowed_transition_time": allowed_transition,
                     "acceleration_limit": float(seam_acceleration[joint]),
                     "ok": joint_ok,
                 })
@@ -249,12 +422,13 @@ def _run_chain(segments: list[dict], handover_tolerance: float) -> dict:
                     violated_joints.append((joint, velocity_change, required_time))
             seam_status = "violated" if violated_joints else "proven"
             seam_info = {
-                "between_segments": [index - 1, index],
+                "between_segments": [previous["index"], index],
                 "between_segment_ids": [previous["segment_id"], segment_id],
                 "between_names": [previous["name"], name],
-                "boundary_time": offset,
-                "transition_window_start": offset - seam_transition_time,
-                "transition_window_end": offset + seam_transition_time,
+                "boundary_time": previous["motion_end"],
+                "wait_duration": pending_dwell,
+                "transition_window_start": previous["motion_end"] - seam_transition_time,
+                "transition_window_end": motion_start + seam_transition_time,
                 "status": seam_status,
                 "confidence": "boundary",
                 "carried_object_id": initial,
@@ -264,15 +438,17 @@ def _run_chain(segments: list[dict], handover_tolerance: float) -> dict:
             seam_checks.append(seam_info)
             for joint, velocity_change, required_time in violated_joints:
                 hazards.append({
-                    "start_time": offset,
-                    "end_time": offset,
+                    "start_time": previous["motion_end"],
+                    "end_time": motion_start,
                     "segment": index,
                     "inner_segment": None,
                     "kind": "velocity_transition",
                     "message": (
                         f"joint {joint + 1} velocity changes {velocity_change:.3f} rad/s between "
-                        f"segments {index} ('{previous['name']}') and {index + 1} ('{name}') at t={offset:.3f}s; "
-                        f"requires {required_time:.3f}s but only {seam_transition_time:.3f}s transition is allowed "
+                        f"segments {previous['index'] + 1} ('{previous['name']}') and {index + 1} ('{name}') "
+                        f"at t={previous['motion_end']:.3f}s; "
+                        f"requires {required_time:.3f}s but only {allowed_transition:.3f}s transition is allowed "
+                        f"(base {seam_transition_time:.3f}s + wait {pending_dwell:.3f}s; "
                         f"(acceleration limit {float(seam_acceleration[joint]):.3f} rad/s^2; "
                         f"carried object: {initial if initial is not None else 'none'})"
                     ),
@@ -283,23 +459,24 @@ def _run_chain(segments: list[dict], handover_tolerance: float) -> dict:
                         "to_velocity": float(entry_velocity[joint]),
                         "velocity_change": velocity_change,
                         "required_transition_time": required_time,
-                        "allowed_transition_time": seam_transition_time,
+                        "allowed_transition_time": allowed_transition,
+                        "wait_duration": pending_dwell,
                         "acceleration_limit": float(seam_acceleration[joint]),
-                        "transition_window_start": offset - seam_transition_time,
-                        "transition_window_end": offset + seam_transition_time,
+                        "transition_window_start": previous["motion_end"] - seam_transition_time,
+                        "transition_window_end": motion_start + seam_transition_time,
                         "carried_object_id": initial,
                     },
                 })
 
-        if previous_end_angles is not None:
+        if current_pose is not None:
             mismatch = max(
                 abs(float(a) - float(b))
-                for a, b in zip(previous_end_angles, operation["waypoints"][0])
+                for a, b in zip(current_pose, operation["waypoints"][0])
             )
             if mismatch > handover_tolerance:
                 hazards.append({
-                    "start_time": offset,
-                    "end_time": offset,
+                    "start_time": motion_start,
+                    "end_time": motion_start,
                     "segment": index,
                     "inner_segment": None,
                     "kind": "handover_mismatch",
@@ -312,8 +489,8 @@ def _run_chain(segments: list[dict], handover_tolerance: float) -> dict:
 
         for hazard in report["hazard_intervals"]:
             hazards.append({
-                "start_time": float(hazard["start_time"]) + offset,
-                "end_time": float(hazard["end_time"]) + offset,
+                "start_time": float(hazard["start_time"]) + motion_start,
+                "end_time": float(hazard["end_time"]) + motion_start,
                 "segment": index,
                 "inner_segment": hazard["segment"],
                 "kind": hazard["kind"],
@@ -323,7 +500,7 @@ def _run_chain(segments: list[dict], handover_tolerance: float) -> dict:
 
         for frame in report["frames"]:
             frames.append({
-                "time": float(frame["time"]) + offset,
+                "time": float(frame["time"]) + motion_start,
                 "local_time": float(frame["time"]),
                 "segment": index,
                 "joint_angles": frame["joint_angles"],
@@ -334,20 +511,40 @@ def _run_chain(segments: list[dict], handover_tolerance: float) -> dict:
 
         carried_ranges.extend(
             item
-            for item in _carried_ranges_for_segment(report, offset, index, initial)
+            for item in _carried_ranges_for_segment(report, motion_start, index, initial)
             if item["end_time"] > item["start_time"] + 1e-9
         )
 
         duration = float(report["duration"])
         handover_out = report["end_state"]
-        previous_end_angles = handover_out["joint_angles"]
+        current_pose = [float(value) for value in handover_out["joint_angles"]]
+        current_link_lengths = [float(value) for value in operation["link_lengths"]]
         initial = handover_out["carried_object_id"]
+        last_sample_dt = float(operation.get("sample_dt", 0.02))
+        motion_end = motion_start + duration
+        offset = motion_end
+        previous_motion = {
+            "index": index,
+            "segment_id": segment_id,
+            "name": name,
+            "operation": operation,
+            "exit_velocity": [float(value) for value in exit_velocity],
+            "motion_end": motion_end,
+        }
+        pending_dwell = 0.0
+        if wait_after > 0:
+            frames.extend(
+                _hold_frames(current_pose, current_link_lengths, initial, objects_by_id, offset, wait_after, last_sample_dt, index)
+            )
+            wait_intervals.append((offset, offset + wait_after))
+            pending_dwell += wait_after
+            offset += wait_after
         per_segment.append({
             "segment_id": segment_id,
             "name": name,
             "digest": digest,
-            "start_time": offset,
-            "end_time": offset + duration,
+            "start_time": segment_start,
+            "end_time": offset,
             "handover_in": entry_state,
             "handover_out": handover_out,
             "status": "proven" if report["valid"] else "violated",
@@ -356,14 +553,17 @@ def _run_chain(segments: list[dict], handover_tolerance: float) -> dict:
             "report": report,
             "entry_velocity": [float(value) for value in entry_velocity],
             "exit_velocity": [float(value) for value in exit_velocity],
+            "kind": "motion",
+            "wait_before": wait_before,
+            "wait_after": wait_after,
         })
-        offset += duration
         boundaries.append(offset)
 
+    carried_ranges = _merge_carried_ranges(carried_ranges, wait_intervals)
     hazards.sort(key=lambda item: (item["start_time"], item["end_time"], item["kind"]))
     unknown_segments = [
         index for index, item in enumerate(per_segment)
-        if item["status"] == "unknown" or item["report"] is None
+        if item["status"] == "unknown"
     ]
     return {
         "segments": per_segment,
@@ -372,6 +572,9 @@ def _run_chain(segments: list[dict], handover_tolerance: float) -> dict:
         "carried_ranges": carried_ranges,
         "seam_checks": seam_checks,
         "boundaries": boundaries,
+        "wait_intervals": [
+            {"start_time": start, "end_time": end} for start, end in wait_intervals
+        ],
         "duration": offset,
         "unknown_segments": unknown_segments,
         "valid": (
@@ -538,6 +741,7 @@ def validate_task(
         "carried_ranges": normal["carried_ranges"],
         "boundaries": normal["boundaries"],
         "seam_checks": normal["seam_checks"],
+        "wait_intervals": normal["wait_intervals"],
         "unknown_segments": normal["unknown_segments"],
         "stale_segments": stale,
         "recheck_required": [item["segment"] for item in stale],

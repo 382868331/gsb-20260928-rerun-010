@@ -370,3 +370,237 @@ def test_speed_change_in_middle_segment_invalidates_downstream_seam_conclusion()
     assert {item["segment"] for item in result["stale_segments"]} == {0, 1}
     assert result["valid"] is True
     assert result["seam_checks"][0]["status"] == "proven"
+
+
+SINGLE_AXIS = dict(
+    BASE,
+    speed_limits=[0.8, 0.8, 0.8],
+    acceleration_limits=[2.0, 2.0, 2.0],
+    velocity_transition_time=0.2,
+    carried_objects=[],
+    pick_events=[],
+    place_events=[],
+)
+
+
+def _single_axis_operation(waypoints, **overrides):
+    operation = dict(SINGLE_AXIS, waypoints=waypoints)
+    operation.update(overrides)
+    return operation
+
+
+def _reversal_task(wait_after=0.0, wait_before=0.0, middle_wait=None):
+    first = _single_axis_operation([[0, 0, 0], [0.56, 0, 0]], wait_after=wait_after)
+    second = _single_axis_operation([[0.56, 0, 0], [0, 0, 0]], wait_before=wait_before)
+    segments = [
+        {"segment_id": "out", "name": "out", "operation": first},
+    ]
+    if middle_wait is not None:
+        segments.append({"segment_id": "dwell", "name": "dwell", "operation": None, "wait": middle_wait})
+    segments.append({"segment_id": "back", "name": "back", "operation": second})
+    return {"name": "reversal", "segments": segments}
+
+
+def test_real_wait_counts_toward_duration_and_seam_transition():
+    no_wait = validate_task(_reversal_task())
+    assert no_wait["valid"] is False
+    assert abs(no_wait["duration"] - 1.4) < 1e-9
+    seam = no_wait["seam_checks"][0]
+    assert seam["status"] == "violated"
+    assert seam["wait_duration"] == 0.0
+    joint = seam["joints"][0]
+    assert abs(joint["required_transition_time"] - 0.8) < 1e-9
+    assert abs(joint["allowed_transition_time"] - 0.2) < 1e-9
+
+    enough = validate_task(_reversal_task(wait_after=0.71))
+    assert abs(enough["duration"] - 2.11) < 1e-9
+    assert enough["valid"] is True
+    seam = enough["seam_checks"][0]
+    assert seam["status"] == "proven"
+    assert abs(seam["wait_duration"] - 0.71) < 1e-9
+    assert abs(seam["joints"][0]["allowed_transition_time"] - 0.91) < 1e-9
+    assert seam["between_segment_ids"] == ["out", "back"]
+    wait_frames = [
+        frame for frame in enough["frames"] if 0.7 < frame["time"] < 1.41
+    ]
+    assert wait_frames
+    assert all(frame["joint_angles"] == [0.56, 0, 0] for frame in wait_frames)
+
+    short = validate_task(_reversal_task(wait_after=0.51))
+    assert abs(short["duration"] - 1.91) < 1e-9
+    assert short["valid"] is False
+    seam = short["seam_checks"][0]
+    assert seam["status"] == "violated"
+    assert abs(seam["joints"][0]["allowed_transition_time"] - 0.71) < 1e-9
+    hazard = [item for item in short["hazards"] if item["kind"] == "velocity_transition"][0]
+    assert abs(hazard["start_time"] - 0.7) < 1e-9
+    assert abs(hazard["end_time"] - 1.21) < 1e-9
+    assert hazard["detail"]["wait_duration"] == 0.51
+
+
+def test_wait_position_variants_give_same_conclusion():
+    at_end = validate_task(_reversal_task(wait_after=0.71))
+    at_start = validate_task(_reversal_task(wait_before=0.71))
+    middle = validate_task(_reversal_task(middle_wait=0.71))
+
+    for result in (at_end, at_start, middle):
+        assert result["valid"] is True
+        assert abs(result["duration"] - 2.11) < 1e-9
+        assert result["seam_checks"][0]["status"] == "proven"
+        assert abs(result["seam_checks"][0]["wait_duration"] - 0.71) < 1e-9
+
+    middle_segment = middle["segments"][1]
+    assert middle_segment["kind"] == "wait"
+    assert abs(middle_segment["end_time"] - middle_segment["start_time"] - 0.71) < 1e-9
+    assert middle["segments"][2]["start_time"] == middle_segment["end_time"]
+
+
+def test_split_wait_does_not_create_extra_transition_margin():
+    split_enough = _reversal_task(wait_after=0.36, middle_wait=0.35)
+    result = validate_task(split_enough)
+    assert result["valid"] is True
+    assert abs(result["duration"] - 2.11) < 1e-9
+    assert abs(result["seam_checks"][0]["wait_duration"] - 0.71) < 1e-9
+
+    split_short = _reversal_task(wait_after=0.26, middle_wait=0.25)
+    result = validate_task(split_short)
+    assert result["valid"] is False
+    assert abs(result["seam_checks"][0]["wait_duration"] - 0.51) < 1e-9
+    assert result["seam_checks"][0]["status"] == "violated"
+
+
+def test_zero_length_action_does_not_relay_wait_credit():
+    task = _reversal_task(wait_after=0.71)
+    task["segments"].insert(1, {
+        "segment_id": "noop",
+        "name": "zero-length",
+        "operation": _single_axis_operation([[0.56, 0, 0], [0.56, 0, 0]]),
+    })
+    result = validate_task(task)
+
+    assert result["valid"] is False
+    first_seam = result["seam_checks"][0]
+    assert first_seam["between_segment_ids"] == ["out", "noop"]
+    assert first_seam["status"] == "proven"
+    second_seam = result["seam_checks"][1]
+    assert second_seam["between_segment_ids"] == ["noop", "back"]
+    assert second_seam["status"] == "violated"
+    assert second_seam["wait_duration"] == 0.0
+
+
+def test_wait_preserves_carry_state_and_extends_carried_range():
+    first = dict(
+        BASE,
+        waypoints=[[-0.65, 0, 0], [-0.2, 0.05, 0], [0.1, 0, 0]],
+        pick_events=[{"waypoint_index": 1, "object_id": "block"}],
+        place_events=[],
+        wait_after=0.6,
+    )
+    second = dict(
+        BASE,
+        waypoints=[[0.1, 0, 0], [0.45, 0.08, 0]],
+        pick_events=[],
+        place_events=[{"waypoint_index": 1, "object_id": "block"}],
+    )
+    task = {
+        "name": "carry-wait",
+        "segments": [
+            {"segment_id": "s1", "name": "pick", "operation": first},
+            {"segment_id": "s2", "name": "place", "operation": second},
+        ],
+    }
+    result = validate_task(task)
+
+    assert result["valid"] is True
+    wait_interval = result["wait_intervals"][0]
+    assert abs(wait_interval["end_time"] - wait_interval["start_time"] - 0.6) < 1e-9
+    carried = result["carried_ranges"]
+    assert len(carried) == 1
+    assert carried[0]["start_time"] < wait_interval["start_time"]
+    assert carried[0]["end_time"] > wait_interval["end_time"]
+    wait_frames = [
+        frame
+        for frame in result["frames"]
+        if wait_interval["start_time"] < frame["time"] < wait_interval["end_time"]
+    ]
+    assert wait_frames
+    assert all(frame["carried_object_id"] == "block" for frame in wait_frames)
+
+
+def test_wait_segment_without_preceding_motion_is_unknown():
+    task = _reversal_task()
+    task["segments"].insert(0, {"segment_id": "dwell", "name": "dwell", "operation": None, "wait": 0.5})
+    result = validate_task(task)
+
+    assert result["valid"] is False
+    assert result["unknown_segments"] == [0]
+    assert result["segments"][0]["status"] == "unknown"
+    assert result["first_hazard"]["kind"] == "handover_state"
+
+
+def test_changing_wait_marks_segment_and_downstream_stale():
+    original = validate_task(_reversal_task(wait_after=0.71))
+    assert original["valid"] is True
+    sources = original["conclusion_sources"]
+
+    shortened = validate_task(_reversal_task(wait_after=0.51), previous=sources)
+    assert shortened["valid"] is False
+    assert {item["segment"] for item in shortened["stale_segments"]} == {0, 1}
+
+    unchanged = validate_task(_reversal_task(wait_after=0.71), previous=sources)
+    assert unchanged["stale_segments"] == []
+    assert unchanged["valid"] is True
+
+
+def test_split_chain_and_whole_motion_with_wait_agree():
+    whole_operation = _single_axis_operation(
+        [[0, 0, 0], [0.56, 0, 0], [0, 0, 0]],
+        segment_speed_limits=[[0.8, 0.8, 0.8], [0.8, 0.8, 0.8]],
+    )
+
+    def run_whole(wait):
+        return validate_motion(
+            whole_operation["waypoints"],
+            whole_operation["speed_limits"],
+            [tuple(pair) for pair in BASE["joint_limits"]],
+            BASE["link_lengths"],
+            [],
+            segment_speed_limits=whole_operation["segment_speed_limits"],
+            acceleration_limits=[2.0, 2.0, 2.0],
+            velocity_transition_time=0.2,
+            wait_events=[{"waypoint_index": 1, "duration": wait}],
+        )
+
+    whole_enough = run_whole(0.71)
+    assert whole_enough["valid"] is True
+    assert abs(whole_enough["duration"] - 2.11) < 1e-9
+    whole_short = run_whole(0.51)
+    assert whole_short["valid"] is False
+    assert whole_short["hazard_intervals"][0]["kind"] == "velocity_transition"
+
+    chain_enough = validate_task(_reversal_task(middle_wait=0.71))
+    chain_short = validate_task(_reversal_task(middle_wait=0.51))
+    assert chain_enough["valid"] == whole_enough["valid"] is True
+    assert chain_short["valid"] == whole_short["valid"] is False
+    assert abs(chain_enough["duration"] - whole_enough["duration"]) < 1e-9
+
+
+def test_waited_task_survives_save_and_reload_revalidation(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "task_store", main.TaskStore(tmp_path))
+    task = TaskDefinition.model_validate(_reversal_task(middle_wait=0.71))
+
+    saved = main.save_task(task)
+    assert saved.executable is True
+    assert abs(saved.last_task_validation["duration"] - 2.11) < 1e-9
+
+    loaded = main.get_task(saved.id)
+    assert loaded.executable is True
+    revalidated = loaded.last_task_validation
+    assert abs(revalidated["duration"] - 2.11) < 1e-9
+    assert revalidated["seam_checks"][0]["status"] == "proven"
+    assert revalidated["stale_segments"] == []
+
+    short_task = TaskDefinition.model_validate(_reversal_task(middle_wait=0.51))
+    saved_short = main.save_task(short_task)
+    assert saved_short.executable is False
+    assert saved_short.last_task_validation["seam_checks"][0]["status"] == "violated"

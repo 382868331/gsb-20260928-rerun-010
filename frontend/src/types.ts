@@ -18,6 +18,11 @@ export type CarryEvent = {
   object_id: string;
 };
 
+export type WaitEvent = {
+  waypoint_index: number;
+  duration: number;
+};
+
 export type Project = {
   name: string;
   waypoints: number[][];
@@ -31,6 +36,9 @@ export type Project = {
   carried_objects: CarriedObject[];
   pick_events: CarryEvent[];
   place_events: CarryEvent[];
+  wait_events: WaitEvent[];
+  wait_before: number;
+  wait_after: number;
   gripper_radius: number;
   constraint_version: string;
   link_radius: number;
@@ -76,6 +84,8 @@ export type Frame = {
 export type ValidationResult = {
   valid: boolean;
   duration: number;
+  wait_duration?: number;
+  waits_at_waypoint?: number[];
   segment_durations: number[];
   frames: Frame[];
   planned_events: PlannedEvent[];
@@ -107,7 +117,8 @@ export type SavedProject = Project & {
 export type TaskSegment = {
   segment_id: string;
   name: string;
-  operation: Project;
+  operation: Project | null;
+  wait?: number | null;
 };
 
 export type FailureSpec = {
@@ -149,6 +160,7 @@ export type HandoverState = {
 export type TaskSegmentResult = {
   segment_id: string;
   name: string;
+  kind?: "motion" | "wait";
   digest: string;
   start_time: number;
   end_time: number;
@@ -160,6 +172,9 @@ export type TaskSegmentResult = {
   report: ValidationResult | null;
   entry_velocity?: number[] | null;
   exit_velocity?: number[] | null;
+  wait_before?: number;
+  wait_after?: number;
+  wait_duration?: number;
 };
 
 export type SeamJointCheck = {
@@ -178,6 +193,7 @@ export type SeamCheck = {
   between_segment_ids: string[];
   between_names?: string[];
   boundary_time: number;
+  wait_duration?: number;
   transition_window_start?: number;
   transition_window_end?: number;
   status: "proven" | "violated" | "unknown";
@@ -238,6 +254,7 @@ export type TaskResult = {
   carried_ranges: CarriedRange[];
   boundaries: number[];
   seam_checks: SeamCheck[];
+  wait_intervals?: { start_time: number; end_time: number }[];
   unknown_segments: number[];
   stale_segments: { segment: number; reason: string }[];
   recheck_required: number[];

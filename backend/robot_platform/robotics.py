@@ -203,6 +203,7 @@ def validate_motion(
     carried_objects: list[dict] | None = None,
     pick_events: list[dict] | None = None,
     place_events: list[dict] | None = None,
+    wait_events: list[dict] | None = None,
     constraint_version: str = "1.1",
     reviewed_segments: list[int] | None = None,
     previous_validation_digest: str | None = None,
@@ -283,12 +284,34 @@ def validate_motion(
     )
     points = [np.asarray(values, dtype=float) for values in waypoints]
     velocities = segment_velocities(points, segment_durations)
-    boundaries = np.cumsum([0.0, *segment_durations[:-1]])
+
+    waits_at_waypoint = [0.0 for _ in points]
+    for event in wait_events or []:
+        index = int(event["waypoint_index"])
+        if not 0 <= index <= len(points) - 1:
+            raise ValueError("wait event waypoint_index must reference an existing waypoint")
+        duration = float(event["duration"])
+        if not np.isfinite(duration) or duration < 0:
+            raise ValueError("wait event duration must be a non-negative finite value")
+        waits_at_waypoint[index] += duration
+    motion_boundaries = np.cumsum([0.0, *segment_durations[:-1]])
+    boundaries = np.asarray(
+        [float(motion_boundaries[i] + sum(waits_at_waypoint[: i + 1])) for i in range(len(motion_boundaries))]
+    )
+    total_wait = float(sum(waits_at_waypoint))
+    total_duration = float(display_times[-1]) + total_wait
+
+    def shift_time(time_value: float) -> float:
+        segment = int(np.searchsorted(motion_boundaries, time_value, side="right") - 1)
+        segment = min(max(segment, 0), max(0, len(segment_durations) - 1))
+        return float(time_value + sum(waits_at_waypoint[: segment + 1]))
+
+    check_times = [shift_time(float(value)) for value in check_times]
     hazards: list[HazardInterval] = []
 
     for segment_index in range(len(velocities) - 1):
         velocity_change = np.abs(velocities[segment_index + 1] - velocities[segment_index])
-        allowed_change = acceleration * velocity_transition_time
+        allowed_change = acceleration * (velocity_transition_time + waits_at_waypoint[segment_index + 1])
         for joint in np.where(velocity_change > allowed_change + 1e-9)[0]:
             hazards.append(
                 HazardInterval(
@@ -304,10 +327,11 @@ def validate_motion(
     planned_events: list[dict] = []
     elapsed = 0.0
     for index in range(len(points)):
+        arrival = elapsed + float(sum(waits_at_waypoint[:index]))
         for object_id in places_by_waypoint.get(index, []):
-            planned_events.append({"type": "place", "waypoint_index": index, "object_id": object_id, "time": elapsed})
+            planned_events.append({"type": "place", "waypoint_index": index, "object_id": object_id, "time": arrival})
         for object_id in picks_by_waypoint.get(index, []):
-            planned_events.append({"type": "pick", "waypoint_index": index, "object_id": object_id, "time": elapsed})
+            planned_events.append({"type": "pick", "waypoint_index": index, "object_id": object_id, "time": arrival})
         if index < len(segment_durations):
             elapsed += segment_durations[index]
 
@@ -424,9 +448,7 @@ def validate_motion(
 
     hazards.sort(key=lambda item: (item.start_time, item.end_time, item.kind))
 
-    frames: list[dict] = []
-    for time, angles in zip(display_times, display_samples):
-        segment = int(np.searchsorted(boundaries, time, side="right") - 1)
+    def make_frame(time_value: float, angles, segment: int) -> dict:
         segment = min(segment, max(0, len(segment_durations) - 1))
         vertices = forward_kinematics(angles, link_lengths)
         active_object_id = active_object_for_segment(
@@ -437,13 +459,29 @@ def validate_motion(
             object_position = carried_object_pose(vertices, angles, objects_by_id[active_object_id])
         frames.append(
             {
-                "time": float(time),
+                "time": float(time_value),
                 "joint_angles": [float(value) for value in angles],
                 "links": [[float(x), float(y)] for x, y in vertices],
                 "carried_object_id": active_object_id,
                 "object_position": None if object_position is None else [float(object_position[0]), float(object_position[1])],
             }
         )
+
+    frames: list[dict] = []
+    for time, angles in zip(display_times, display_samples):
+        segment = int(np.searchsorted(motion_boundaries, time, side="right") - 1)
+        segment = min(max(segment, 0), max(0, len(segment_durations) - 1))
+        make_frame(shift_time(float(time)), angles, segment)
+    for waypoint_index, wait_duration in enumerate(waits_at_waypoint):
+        if wait_duration <= 0:
+            continue
+        arrival = float(sum(segment_durations[:waypoint_index]) + sum(waits_at_waypoint[:waypoint_index]))
+        segment = min(waypoint_index, max(0, len(segment_durations) - 1))
+        count = max(1, int(np.floor(wait_duration / sample_dt + 1e-9)))
+        for step in range(1, count + 1):
+            dwell_time = min(arrival + step * sample_dt, arrival + wait_duration)
+            make_frame(dwell_time, points[waypoint_index], segment)
+    frames.sort(key=lambda item: item["time"])
 
     first_hazard = hazards[0] if hazards else None
     first = None if first_hazard is None else Collision(
@@ -458,7 +496,9 @@ def validate_motion(
     affected_segments = sorted({item.segment for item in hazards})
     return {
         "valid": not hazards,
-        "duration": float(display_times[-1]),
+        "duration": total_duration,
+        "wait_duration": total_wait,
+        "waits_at_waypoint": [float(value) for value in waits_at_waypoint],
         "start_state": {
             "joint_angles": [float(value) for value in points[0]],
             "carried_object_id": None if initial_carried_object_id is None else str(initial_carried_object_id),
@@ -480,7 +520,7 @@ def validate_motion(
         "hazard_intervals": [item.__dict__ for item in hazards],
         "replay_window": None if first_hazard is None else {
             "start_time": max(0.0, first_hazard.start_time - max(COLLISION_CHECK_DT, sample_dt)),
-            "end_time": min(float(display_times[-1]), first_hazard.end_time + max(COLLISION_CHECK_DT, sample_dt)),
+            "end_time": min(total_duration, first_hazard.end_time + max(COLLISION_CHECK_DT, sample_dt)),
             "segment": first_hazard.segment,
         },
         "review": {

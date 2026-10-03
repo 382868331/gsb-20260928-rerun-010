@@ -131,3 +131,59 @@ def test_speed_change_at_continuous_segment_boundary_is_checked():
 
     assert result["valid"] is False
     assert result["first_collision"]["kind"] == "velocity_transition"
+
+
+def test_wait_events_extend_duration_and_credit_internal_transition():
+    waypoints = [[0, 0, 0], [0.56, 0, 0], [0, 0, 0]]
+    kwargs = dict(
+        joint_limits=JOINT_LIMITS,
+        link_lengths=LINK_LENGTHS,
+        obstacles=[],
+        segment_speed_limits=[[0.8, 0.8, 0.8], [0.8, 0.8, 0.8]],
+        acceleration_limits=[2.0, 2.0, 2.0],
+        velocity_transition_time=0.2,
+    )
+
+    no_wait = validate_motion(waypoints, [0.8, 0.8, 0.8], **kwargs)
+    assert no_wait["valid"] is False
+    assert abs(no_wait["duration"] - 1.4) < 1e-9
+
+    enough = validate_motion(
+        waypoints, [0.8, 0.8, 0.8], wait_events=[{"waypoint_index": 1, "duration": 0.71}], **kwargs
+    )
+    assert enough["valid"] is True
+    assert abs(enough["duration"] - 2.11) < 1e-9
+    assert abs(enough["wait_duration"] - 0.71) < 1e-9
+    dwell_frames = [frame for frame in enough["frames"] if 0.7 < frame["time"] < 1.41]
+    assert dwell_frames
+    assert all(frame["joint_angles"] == [0.56, 0, 0] for frame in dwell_frames)
+
+    short = validate_motion(
+        waypoints, [0.8, 0.8, 0.8], wait_events=[{"waypoint_index": 1, "duration": 0.51}], **kwargs
+    )
+    assert short["valid"] is False
+    hazard = short["hazard_intervals"][0]
+    assert hazard["kind"] == "velocity_transition"
+    assert abs(hazard["start_time"] - 1.21) < 1e-9
+
+
+def test_wait_events_shift_planned_event_times():
+    result = validate_motion(
+        [[0, 0, 0], [0.56, 0, 0], [0, 0, 0]],
+        [0.8, 0.8, 0.8],
+        JOINT_LIMITS,
+        LINK_LENGTHS,
+        [],
+        segment_speed_limits=[[0.8, 0.8, 0.8], [0.8, 0.8, 0.8]],
+        acceleration_limits=[2.0, 2.0, 2.0],
+        velocity_transition_time=0.2,
+        carried_objects=[{"id": "block", "name": "block", "radius": 0.08}],
+        pick_events=[{"waypoint_index": 0, "object_id": "block"}],
+        place_events=[{"waypoint_index": 2, "object_id": "block"}],
+        wait_events=[{"waypoint_index": 1, "duration": 0.71}],
+    )
+
+    assert result["valid"] is True
+    events = {event["type"]: event["time"] for event in result["planned_events"]}
+    assert abs(events["pick"] - 0.0) < 1e-9
+    assert abs(events["place"] - 2.11) < 1e-9
