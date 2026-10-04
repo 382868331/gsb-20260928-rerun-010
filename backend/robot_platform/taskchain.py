@@ -411,23 +411,42 @@ def _run_chain(segments: list[dict], handover_tolerance: float) -> dict:
             for joint in range(dof):
                 accel_limit = float(seam_acceleration[joint])
                 if wait_time > 0:
-                    stop_change = max(abs(float(from_velocity[joint])), abs(float(entry_velocity[joint])))
-                    required_time = stop_change / accel_limit if accel_limit > 0 else float("inf")
-                    allowed_time = wait_time
+                    # Brake from the exit velocity to a full stop, dwell, then
+                    # accelerate up to the next segment's entry velocity. The
+                    # whole brake-and-reaccelerate sequence shares one joint
+                    # acceleration budget, so its required time is
+                    # (|v_out| + |v_in|) / a, never the larger of the two
+                    # halves. The two segments permit one transition window at
+                    # the boundary; the stricter (shorter) one applies, and it
+                    # adds to the real dwell time. A zero-length motion between
+                    # two dwells resets pending wait, so the dwells cannot merge.
+                    brake_velocity = abs(float(from_velocity[joint]))
+                    reaccel_velocity = abs(float(entry_velocity[joint]))
+                    velocity_change = brake_velocity + reaccel_velocity
+                    previous_window = float(previous["transition_time"]) if previous["duration"] > 1e-9 else 0.0
+                    current_window = float(transition_time) if float(report["duration"]) > 1e-9 else 0.0
+                    ramp_time = min(previous_window, current_window)
+                    required_time = velocity_change / accel_limit if accel_limit > 0 else float("inf")
+                    required_dwell_time = max(0.0, required_time - ramp_time)
+                    allowed_time = wait_time + ramp_time
                     joint_ok = required_time <= allowed_time + 1e-9
-                    velocity_change = stop_change
                 else:
-                    velocity_change = abs(float(entry_velocity[joint] - from_velocity[joint]))
+                    velocity_change = abs(float(entry_velocity[joint]) - float(from_velocity[joint]))
                     allowed_time = min(previous["transition_time"], transition_time)
                     required_time = velocity_change / accel_limit if accel_limit > 0 else float("inf")
                     joint_ok = velocity_change <= accel_limit * allowed_time + 1e-9
+                    ramp_time = 0.0
+                    required_dwell_time = required_time
                 joint_results.append({
                     "joint": joint + 1,
                     "from_velocity": float(from_velocity[joint]),
                     "to_velocity": float(entry_velocity[joint]),
                     "velocity_change": velocity_change,
                     "required_transition_time": required_time,
+                    "required_dwell_time": required_dwell_time,
                     "allowed_transition_time": allowed_time,
+                    "ramp_time": ramp_time,
+                    "dwell_time": wait_time,
                     "acceleration_limit": accel_limit,
                     "ok": joint_ok,
                 })
@@ -442,6 +461,13 @@ def _run_chain(segments: list[dict], handover_tolerance: float) -> dict:
                 "transition_window_start": offset - wait_time if wait_time > 0 else offset - min(previous["transition_time"], transition_time),
                 "transition_window_end": offset if wait_time > 0 else offset + min(previous["transition_time"], transition_time),
                 "wait_time": wait_time,
+                "ramp_time": (
+                    min(
+                        float(previous["transition_time"]) if previous["duration"] > 1e-9 else 0.0,
+                        float(transition_time) if float(report["duration"]) > 1e-9 else 0.0,
+                    )
+                    if wait_time > 0 else 0.0
+                ),
                 "status": seam_status,
                 "confidence": "boundary",
                 "carried_object_id": initial,
@@ -452,12 +478,15 @@ def _run_chain(segments: list[dict], handover_tolerance: float) -> dict:
             for joint, velocity_change, required_time in violated_joints:
                 allowed_time = joint_results[joint]["allowed_transition_time"]
                 if wait_time > 0:
+                    required_dwell = joint_results[joint]["required_dwell_time"]
+                    ramp_time = joint_results[joint]["ramp_time"]
                     message = (
-                        f"joint {joint + 1} must brake {abs(float(from_velocity[joint])):.3f} rad/s to a stop and "
-                        f"re-accelerate to {abs(float(entry_velocity[joint])):.3f} rad/s across the "
-                        f"{wait_time:.3f}s wait between segments {previous['index'] + 1} ('{previous['name']}') and "
-                        f"{index + 1} ('{name}') ending at t={offset:.3f}s; requires {required_time:.3f}s but the "
-                        f"wait provides {wait_time:.3f}s "
+                        f"joint {joint + 1} must brake {abs(float(from_velocity[joint])):.3f} rad/s to a stop, dwell, and "
+                        f"re-accelerate to {abs(float(entry_velocity[joint])):.3f} rad/s across the wait between "
+                        f"segments {previous['index'] + 1} ('{previous['name']}') and {index + 1} ('{name}') ending at "
+                        f"t={offset:.3f}s; the full brake-and-reaccelerate sequence requires {required_time:.3f}s, the two "
+                        f"motion segments supply {ramp_time:.3f}s of ramp windows so the dwell itself must last "
+                        f"{required_dwell:.3f}s but the wait provides only {wait_time:.3f}s "
                         f"(acceleration limit {joint_results[joint]['acceleration_limit']:.3f} rad/s^2; "
                         f"carried object: {initial if initial is not None else 'none'})"
                     )
@@ -483,7 +512,9 @@ def _run_chain(segments: list[dict], handover_tolerance: float) -> dict:
                         "to_velocity": float(entry_velocity[joint]),
                         "velocity_change": velocity_change,
                         "required_transition_time": required_time,
+                        "required_dwell_time": required_dwell if wait_time > 0 else required_time,
                         "allowed_transition_time": allowed_time,
+                        "ramp_time": joint_results[joint]["ramp_time"],
                         "acceleration_limit": joint_results[joint]["acceleration_limit"],
                         "wait_time": wait_time,
                         "transition_window_start": seam_info["transition_window_start"],
@@ -551,6 +582,7 @@ def _run_chain(segments: list[dict], handover_tolerance: float) -> dict:
             "exit_velocity": [float(value) for value in exit_velocity],
             "acceleration": acceleration,
             "transition_time": transition_time,
+            "duration": float(duration),
         }
         pending_wait = 0.0
         per_segment.append({

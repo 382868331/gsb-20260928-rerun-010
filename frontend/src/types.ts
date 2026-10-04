@@ -175,7 +175,10 @@ export type SeamJointCheck = {
   to_velocity: number;
   velocity_change: number;
   required_transition_time: number;
+  required_dwell_time?: number;
   allowed_transition_time: number;
+  ramp_time?: number;
+  dwell_time?: number;
   acceleration_limit: number;
   ok: boolean;
 };
@@ -188,6 +191,7 @@ export type SeamCheck = {
   wait_time?: number;
   transition_window_start?: number;
   transition_window_end?: number;
+  ramp_time?: number;
   status: "proven" | "violated" | "unknown";
   confidence: string;
   carried_object_id: string | null;

@@ -689,7 +689,10 @@ export default function App() {
                   {typeof seam.wait_time === "number" && seam.wait_time > 0 ? `，等待 ${seam.wait_time.toFixed(2)}s` : ""}
                   ，携带 {seam.carried_object_id ?? "无"}
                   {seam.joints.filter((joint) => !joint.ok).map((joint) =>
-                    `；关节${joint.joint} ${joint.from_velocity.toFixed(2)}→${joint.to_velocity.toFixed(2)} rad/s，需 ${joint.required_transition_time.toFixed(2)}s / 允许 ${joint.allowed_transition_time.toFixed(2)}s`,
+                    `；关节${joint.joint} ${joint.from_velocity.toFixed(2)}→${joint.to_velocity.toFixed(2)} rad/s，减速到停再反向加速共需 ${joint.required_transition_time.toFixed(2)}s`
+                    + (typeof seam.wait_time === "number" && seam.wait_time > 0
+                      ? `（其中停留至少 ${(joint.required_dwell_time ?? joint.required_transition_time).toFixed(2)}s，过渡窗口 ${(joint.ramp_time ?? 0).toFixed(2)}s，实际等待 ${seam.wait_time.toFixed(2)}s）`
+                      : ` / 允许 ${joint.allowed_transition_time.toFixed(2)}s`),
                   )}
                 </div>
               ))}

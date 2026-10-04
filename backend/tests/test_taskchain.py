@@ -412,7 +412,10 @@ def test_wait_enters_total_time_and_proves_seam():
     assert all(item["ok"] for item in seam["joints"])
     joint1 = next(item for item in seam["joints"] if item["joint"] == 1)
     assert abs(joint1["required_transition_time"] - 0.6) < 1e-9
-    assert joint1["allowed_transition_time"] == 0.71
+    # 0.71s dwell plus the stricter 0.2s boundary transition window.
+    assert abs(joint1["required_dwell_time"] - 0.4) < 1e-9
+    assert abs(joint1["allowed_transition_time"] - 0.91) < 1e-9
+    assert abs(joint1["dwell_time"] - 0.71) < 1e-9
     wait_frames = [frame for frame in result["frames"] if 0.7 < frame["time"] < 1.41]
     assert wait_frames
     for frame in wait_frames:
@@ -420,18 +423,91 @@ def test_wait_enters_total_time_and_proves_seam():
 
 
 def test_short_wait_keeps_seam_rejected_with_real_duration():
-    result = validate_task(_two_motion_task(wait=0.51))
+    result = validate_task(_two_motion_task(wait=0.31))
 
     assert result["valid"] is False
-    assert abs(result["duration"] - 1.91) < 1e-9
+    assert abs(result["duration"] - 1.71) < 1e-9
     seam = result["seam_checks"][0]
     assert seam["status"] == "violated"
     hazard = next(item for item in result["hazards"] if item["kind"] == "velocity_transition")
     assert abs(hazard["start_time"] - 0.7) < 1e-9
-    assert abs(hazard["end_time"] - 1.21) < 1e-9
-    assert hazard["detail"]["wait_time"] == 0.51
+    assert abs(hazard["end_time"] - 1.01) < 1e-9
+    assert hazard["detail"]["wait_time"] == 0.31
     assert abs(hazard["detail"]["required_transition_time"] - 0.6) < 1e-9
-    assert hazard["detail"]["allowed_transition_time"] == 0.51
+    assert abs(hazard["detail"]["required_dwell_time"] - 0.4) < 1e-9
+    assert abs(hazard["detail"]["allowed_transition_time"] - 0.51) < 1e-9
+
+
+def _reversal_task(wait, wait_mode="wait_after"):
+    segments = [
+        {"segment_id": "out", "name": "out", "operation": _reversal_operation([[0, 0, 0], [0.7, 0, 0]])},
+        {"segment_id": "back", "name": "back", "operation": _reversal_operation([[0.7, 0, 0], [0, 0, 0]])},
+    ]
+    if wait_mode == "wait_after":
+        segments[0]["wait_after"] = wait
+    elif wait_mode == "wait_before":
+        segments[1]["wait_before"] = wait
+    else:
+        segments.insert(1, {"segment_id": "dwell", "name": "dwell", "operation": None, "wait": wait})
+    return {"name": "reversal", "segments": segments}
+
+
+def _reversal_operation(waypoints):
+    return dict(
+        BASE,
+        waypoints=waypoints,
+        speed_limits=[1, 1, 1],
+        segment_speed_limits=[[1, 1, 1]],
+        acceleration_limits=[2, 2, 2],
+        velocity_transition_time=0.3,
+        pick_events=[],
+        place_events=[],
+    )
+
+
+def test_reversal_across_wait_counts_full_brake_and_reaccelerate():
+    rejected = validate_task(_reversal_task(wait=0.51))
+    assert rejected["valid"] is False
+    seam = rejected["seam_checks"][0]
+    joint1 = seam["joints"][0]
+    assert joint1["from_velocity"] == 1.0
+    assert joint1["to_velocity"] == -1.0
+    # The full brake (+1 -> 0) and reverse acceleration (0 -> -1) needs 1.0s,
+    # not the 0.5s obtained by taking the larger half.
+    assert joint1["velocity_change"] == pytest.approx(2.0)
+    assert joint1["required_transition_time"] == pytest.approx(1.0)
+    assert joint1["required_dwell_time"] == pytest.approx(0.7)
+    assert joint1["ramp_time"] == pytest.approx(0.3)
+    assert joint1["allowed_transition_time"] == pytest.approx(0.81)
+    hazard = next(item for item in rejected["hazards"] if item["kind"] == "velocity_transition")
+    assert hazard["detail"]["required_dwell_time"] == pytest.approx(0.7)
+    assert "dwell" in hazard["message"]
+
+    approved = validate_task(_reversal_task(wait=0.71))
+    assert approved["valid"] is True
+    assert approved["seam_checks"][0]["joints"][0]["ok"] is True
+
+    # Splitting the same 0.71s dwell into 0.2 + 0.51 around the same boundary
+    # must give the identical conclusion as one 0.71s wait.
+    task = _reversal_task(wait=0.51)
+    task["segments"][1]["wait_before"] = 0.2
+    split = validate_task(task)
+    assert split["valid"] is True
+    assert split["seam_checks"][0]["wait_time"] == pytest.approx(0.71)
+
+    # A zero-length motion between the two dwell pieces adds no ramp window
+    # and merges no dwell time, so each short wait is rejected on its own.
+    blocked = _reversal_task(wait=0.51)
+    blocked["segments"].insert(1, {
+        "segment_id": "hold",
+        "name": "hold",
+        "operation": _reversal_operation([[0.7, 0, 0], [0.7, 0, 0]]),
+        "wait_after": 0.2,
+    })
+    blocked_result = validate_task(blocked)
+    assert blocked_result["valid"] is False
+    dwells = [(seam["wait_time"], seam["ramp_time"]) for seam in blocked_result["seam_checks"]]
+    assert dwells == [(0.51, 0.0), (0.2, 0.0)]
 
 
 def test_same_combination_without_wait_is_rejected_at_1_4s():
@@ -512,7 +588,7 @@ def test_split_recombination_vs_whole_motion_three_conclusion_kinds():
     recombined_ok = validate_task(_two_motion_task(wait=0.71))
     assert recombined_ok["valid"] is True
 
-    recombined_rejected = validate_task(_two_motion_task(wait=0.51))
+    recombined_rejected = validate_task(_two_motion_task(wait=0.31))
     assert recombined_rejected["valid"] is False
     assert recombined_rejected["unknown_segments"] == []
 
@@ -564,7 +640,7 @@ def test_changing_wait_marks_segment_stale_and_reload_revalidates(tmp_path, monk
     assert loaded.last_task_validation["seam_checks"][0]["wait_time"] == 0.71
 
     sources = saved.last_task_validation["conclusion_sources"]
-    changed = TaskDefinition.model_validate(_two_motion_task(wait=0.51))
+    changed = TaskDefinition.model_validate(_two_motion_task(wait=0.31))
     result = main.run_task_validation(changed, previous=sources)
     assert {item["segment"] for item in result["stale_segments"]} == {0, 1}
     assert result["valid"] is False
