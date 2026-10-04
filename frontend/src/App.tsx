@@ -53,6 +53,8 @@ export default function App() {
   const [abnormalView, setAbnormalView] = useState(false);
   const [savedTasks, setSavedTasks] = useState<SavedTask[]>([]);
   const [currentTaskId, setCurrentTaskId] = useState<string | null>(null);
+  const [waitCompare, setWaitCompare] = useState({ boundary: 0, short: 0.51, enough: 0.71 });
+  const [waitComparison, setWaitComparison] = useState<{ label: string; wait: number; result: TaskResult }[] | null>(null);
 
   const activeTaskPlan = taskMode && taskResult ? (abnormalView && taskResult.abnormal ? taskResult.abnormal : taskResult) : null;
   const viewFrames: Frame[] = activeTaskPlan ? activeTaskPlan.frames : result?.frames ?? [];
@@ -288,9 +290,65 @@ export default function App() {
     }
   };
 
+  const updateSegmentWait = (index: number, field: "wait" | "wait_before" | "wait_after", value: number) => {
+    setTask((current) => {
+      const next: TaskDefinition = JSON.parse(JSON.stringify(current));
+      next.segments[index][field] = Math.max(0, value);
+      return next;
+    });
+  };
+
+  const addWaitSegment = () => {
+    setTask((current) => ({
+      ...current,
+      segments: [
+        ...current.segments,
+        { segment_id: `wait-${Date.now()}-${current.segments.length}`, name: "等待", operation: null, wait: 0.5 },
+      ],
+    }));
+  };
+
+  const conclusionLabel = (outcome: TaskResult) =>
+    outcome.valid ? "通过" : outcome.unknown_segments.length > 0 ? "状态不足" : "拒绝";
+
+  const compareWaitVariants = async () => {
+    setMessage("");
+    const boundary = Math.min(waitCompare.boundary, Math.max(0, task.segments.length - 2));
+    const variants = [
+      { label: "无等待", wait: 0 },
+      { label: "短等待", wait: waitCompare.short },
+      { label: "足够等待", wait: waitCompare.enough },
+    ];
+    try {
+      const outcomes = [];
+      for (const variant of variants) {
+        const nextTask: TaskDefinition = JSON.parse(JSON.stringify(task));
+        nextTask.segments[boundary].wait_after = variant.wait;
+        const result = await validateTask(nextTask, null);
+        outcomes.push({ ...variant, result });
+      }
+      setWaitComparison(outcomes);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "等待对比失败");
+    }
+  };
+
+  const applyWaitToTask = (wait: number) => {
+    const boundary = Math.min(waitCompare.boundary, Math.max(0, task.segments.length - 2));
+    updateSegmentWait(boundary, "wait_after", wait);
+  };
+
+  const persistTaskAndReload = async () => {
+    const saved = currentTaskId ? await updateTask(currentTaskId, task) : await saveTask(task);
+    setCurrentTaskId(saved.id);
+    setSavedTasks(await listTasks());
+    await loadTask(saved.id);
+    setMessage(saved.executable ? `任务已保存并重开校验通过：${saved.name}` : `任务已保存并重开校验：${saved.name}（仍不可执行）`);
+  };
+
   const taskObjectOptions = useMemo(() => {
     const byId = new Map<string, string>();
-    task.segments.forEach((segment) => segment.operation.carried_objects.forEach((item) => byId.set(item.id, item.name)));
+    task.segments.forEach((segment) => (segment.operation?.carried_objects ?? []).forEach((item) => byId.set(item.id, item.name)));
     return Array.from(byId, ([id, name]) => ({ id, name }));
   }, [task.segments]);
 
@@ -583,22 +641,60 @@ export default function App() {
               (hazard) => hazard.segment === index && hazard.kind.startsWith("handover"),
             );
             return (
-              <div className="limit-row" key={segment.segment_id}>
-                <span>
-                  段{index + 1} {segment.name}
-                  {segmentResult ? (segmentResult.valid ? "·安全" : "·危险") : "·未校验"}
-                  {stale ? "·需复核" : ""}
-                  {index > 0 && (handoverHazard ? "·交接异常" : segmentResult?.handover_out ? "·交接一致" : "")}
-                </span>
-                <button onClick={() => replaceTaskSegment(index)}>替换为当前工程</button>
-                <button className="icon" onClick={() => removeTaskSegment(index)}>×</button>
+              <div key={segment.segment_id}>
+                <div className="limit-row">
+                  <span>
+                    段{index + 1} {segment.name}
+                    {segment.operation === null ? "·等待段" : ""}
+                    {segmentResult ? (segmentResult.valid ? "·安全" : "·危险") : "·未校验"}
+                    {segmentResult ? ` ${segmentResult.start_time.toFixed(2)}–${segmentResult.end_time.toFixed(2)}s` : ""}
+                    {stale ? "·需复核" : ""}
+                    {index > 0 && (handoverHazard ? "·交接异常" : segmentResult?.handover_out ? "·交接一致" : "")}
+                  </span>
+                  {segment.operation !== null && (
+                    <button onClick={() => replaceTaskSegment(index)}>替换为当前工程</button>
+                  )}
+                  <button className="icon" onClick={() => removeTaskSegment(index)}>×</button>
+                </div>
+                {segment.operation === null ? (
+                  <label className="single-input">等待时长 s
+                    <NumberInput value={segment.wait ?? 0} step={0.05} onChange={(next) => updateSegmentWait(index, "wait", next)} />
+                  </label>
+                ) : (
+                  <div className="limit-row">
+                    <label className="single-input">段前等待 s
+                      <NumberInput value={segment.wait_before ?? 0} step={0.05} onChange={(next) => updateSegmentWait(index, "wait_before", next)} />
+                    </label>
+                    <label className="single-input">段后等待 s
+                      <NumberInput value={segment.wait_after ?? 0} step={0.05} onChange={(next) => updateSegmentWait(index, "wait_after", next)} />
+                    </label>
+                  </div>
+                )}
               </div>
             );
           })}
           <button onClick={addTaskSegment}>加入当前工程为一段</button>
+          <button onClick={addWaitSegment}>新增独立等待段</button>
           <button className="primary" onClick={() => runTaskValidation()} disabled={task.segments.length < 2}>
             校验完整任务
           </button>
+          {taskResult && taskResult.seam_checks.length > 0 && (
+            <div className="message">
+              接缝校验：
+              {taskResult.seam_checks.map((seam, seamIndex) => (
+                <div key={seamIndex}>
+                  {seam.between_segment_ids.join(" → ")}：
+                  {seam.status === "proven" ? "已证实可执行" : seam.status === "violated" ? "违反" : "状态未知"}
+                  ，缝处 {seam.boundary_time.toFixed(2)}s
+                  {typeof seam.wait_time === "number" && seam.wait_time > 0 ? `，等待 ${seam.wait_time.toFixed(2)}s` : ""}
+                  ，携带 {seam.carried_object_id ?? "无"}
+                  {seam.joints.filter((joint) => !joint.ok).map((joint) =>
+                    `；关节${joint.joint} ${joint.from_velocity.toFixed(2)}→${joint.to_velocity.toFixed(2)} rad/s，需 ${joint.required_transition_time.toFixed(2)}s / 允许 ${joint.allowed_transition_time.toFixed(2)}s`,
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
           {taskResult && (
             <div className="message">
               实际携带：
@@ -609,6 +705,47 @@ export default function App() {
                 `；无法确认：${taskResult.unknown_intervals
                   .map((interval) => `${interval.start_time.toFixed(2)}s 起（段${interval.segment + 1}）`)
                   .join("、")}`}
+            </div>
+          )}
+
+          <h2>等待对比</h2>
+          <label className="single-input">对比接缝
+            <select
+              value={Math.min(waitCompare.boundary, Math.max(0, task.segments.length - 2))}
+              onChange={(event) => setWaitCompare({ ...waitCompare, boundary: Number(event.target.value) })}
+            >
+              {task.segments.slice(0, -1).map((segment, index) => (
+                <option key={segment.segment_id} value={index}>段{index + 1} → 段{index + 2}</option>
+              ))}
+            </select>
+          </label>
+          <div className="limit-row">
+            <label className="single-input">短等待 s
+              <NumberInput value={waitCompare.short} step={0.05} onChange={(next) => setWaitCompare({ ...waitCompare, short: next })} />
+            </label>
+            <label className="single-input">足够等待 s
+              <NumberInput value={waitCompare.enough} step={0.05} onChange={(next) => setWaitCompare({ ...waitCompare, enough: next })} />
+            </label>
+          </div>
+          <button onClick={compareWaitVariants} disabled={task.segments.length < 2}>
+            对比无等待 / 短等待 / 足够等待
+          </button>
+          {waitComparison && (
+            <div className="message">
+              {waitComparison.map((entry) => (
+                <div key={entry.label}>
+                  {entry.label} {entry.wait.toFixed(2)}s：{conclusionLabel(entry.result)}
+                  ，总时长 {entry.result.duration.toFixed(2)}s
+                  {entry.result.first_hazard
+                    ? `，首次违反 ${entry.result.first_hazard.start_time.toFixed(2)}–${entry.result.first_hazard.end_time.toFixed(2)}s`
+                    : ""}
+                  {entry.result.unknown_segments.length > 0
+                    ? `，状态不足段 ${entry.result.unknown_segments.map((item) => item + 1).join("、")}`
+                    : ""}
+                </div>
+              ))}
+              <button onClick={() => applyWaitToTask(waitCompare.enough)}>应用足够等待到任务</button>
+              <button onClick={persistTaskAndReload}>保存并重开后重新校验</button>
             </div>
           )}
 

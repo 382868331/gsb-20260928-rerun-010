@@ -1,3 +1,5 @@
+import pytest
+
 from robot_platform import main
 from robot_platform.robotics import validate_motion
 from robot_platform.schemas import TaskDefinition, TaskValidationRequest
@@ -370,3 +372,202 @@ def test_speed_change_in_middle_segment_invalidates_downstream_seam_conclusion()
     assert {item["segment"] for item in result["stale_segments"]} == {0, 1}
     assert result["valid"] is True
     assert result["seam_checks"][0]["status"] == "proven"
+
+
+def _single_axis_operation(waypoints, speed_limits):
+    return dict(
+        BASE,
+        waypoints=waypoints,
+        speed_limits=speed_limits,
+        acceleration_limits=[1, 1, 1],
+        velocity_transition_time=0.2,
+        pick_events=[],
+        place_events=[],
+    )
+
+
+def _two_motion_task(wait=None, wait_mode="wait_after"):
+    segments = [
+        {"segment_id": "move-a", "name": "move-a", "operation": _single_axis_operation([[0, 0, 0], [0.42, 0, 0]], [0.6, 1, 1])},
+        {"segment_id": "move-b", "name": "move-b", "operation": _single_axis_operation([[0.42, 0, 0], [0.42, 0.42, 0]], [1, 0.6, 1])},
+    ]
+    if wait is not None:
+        if wait_mode == "wait_after":
+            segments[0]["wait_after"] = wait
+        elif wait_mode == "wait_before":
+            segments[1]["wait_before"] = wait
+        elif wait_mode == "standalone":
+            segments.insert(1, {"segment_id": "dwell", "name": "dwell", "operation": None, "wait": wait})
+    return {"name": "two-motions", "segments": segments}
+
+
+def test_wait_enters_total_time_and_proves_seam():
+    result = validate_task(_two_motion_task(wait=0.71))
+
+    assert result["valid"] is True
+    assert abs(result["duration"] - 2.11) < 1e-9
+    seam = result["seam_checks"][0]
+    assert seam["status"] == "proven"
+    assert seam["wait_time"] == 0.71
+    assert all(item["ok"] for item in seam["joints"])
+    joint1 = next(item for item in seam["joints"] if item["joint"] == 1)
+    assert abs(joint1["required_transition_time"] - 0.6) < 1e-9
+    assert joint1["allowed_transition_time"] == 0.71
+    wait_frames = [frame for frame in result["frames"] if 0.7 < frame["time"] < 1.41]
+    assert wait_frames
+    for frame in wait_frames:
+        assert frame["joint_angles"] == pytest.approx([0.42, 0, 0])
+
+
+def test_short_wait_keeps_seam_rejected_with_real_duration():
+    result = validate_task(_two_motion_task(wait=0.51))
+
+    assert result["valid"] is False
+    assert abs(result["duration"] - 1.91) < 1e-9
+    seam = result["seam_checks"][0]
+    assert seam["status"] == "violated"
+    hazard = next(item for item in result["hazards"] if item["kind"] == "velocity_transition")
+    assert abs(hazard["start_time"] - 0.7) < 1e-9
+    assert abs(hazard["end_time"] - 1.21) < 1e-9
+    assert hazard["detail"]["wait_time"] == 0.51
+    assert abs(hazard["detail"]["required_transition_time"] - 0.6) < 1e-9
+    assert hazard["detail"]["allowed_transition_time"] == 0.51
+
+
+def test_same_combination_without_wait_is_rejected_at_1_4s():
+    result = validate_task(_two_motion_task())
+
+    assert result["valid"] is False
+    assert abs(result["duration"] - 1.4) < 1e-9
+    assert result["seam_checks"][0]["status"] == "violated"
+    assert result["seam_checks"][0]["wait_time"] == 0.0
+
+
+def test_wait_at_next_segment_start_matches_wait_at_previous_end():
+    result = validate_task(_two_motion_task(wait=0.71, wait_mode="wait_before"))
+
+    assert result["valid"] is True
+    assert abs(result["duration"] - 2.11) < 1e-9
+    assert result["seam_checks"][0]["status"] == "proven"
+    assert result["segments"][1]["wait_before"] == 0.71
+
+
+def test_standalone_wait_segment_matches_attached_wait():
+    result = validate_task(_two_motion_task(wait=0.71, wait_mode="standalone"))
+
+    assert result["valid"] is True
+    assert abs(result["duration"] - 2.11) < 1e-9
+    wait_segment = result["segments"][1]
+    assert wait_segment["kind"] == "wait"
+    assert wait_segment["status"] == "proven"
+    assert wait_segment["start_time"] == pytest.approx(0.7)
+    assert abs(wait_segment["end_time"] - 1.41) < 1e-9
+    assert wait_segment["entry_velocity"] == [0.0, 0.0, 0.0]
+    assert result["unknown_segments"] == []
+    proven = [seam for seam in result["seam_checks"] if seam["status"] == "proven"]
+    assert len(proven) == 1
+    assert proven[0]["between_segment_ids"] == ["move-a", "move-b"]
+    assert proven[0]["wait_time"] == 0.71
+
+
+def test_split_wait_around_zero_length_motion_gains_no_extra_budget():
+    task = _two_motion_task(wait=0.36)
+    task["segments"].insert(1, {
+        "segment_id": "zero",
+        "name": "zero-length",
+        "operation": _single_axis_operation([[0.42, 0, 0], [0.42, 0, 0]], [1, 1, 1]),
+        "wait_after": 0.35,
+    })
+    result = validate_task(task)
+
+    assert result["valid"] is False
+    budgets = [seam["wait_time"] for seam in result["seam_checks"]]
+    assert budgets == [0.36, 0.35]
+    assert all(seam["status"] == "violated" for seam in result["seam_checks"])
+
+
+def test_adjacent_wait_pieces_merge_into_one_contiguous_dwell():
+    task = _two_motion_task(wait=0.36)
+    task["segments"][1]["wait_before"] = 0.35
+    result = validate_task(task)
+
+    assert result["valid"] is True
+    assert abs(result["duration"] - 2.11) < 1e-9
+    assert result["seam_checks"][0]["wait_time"] == 0.71
+
+
+def test_split_recombination_vs_whole_motion_three_conclusion_kinds():
+    whole = validate_motion(
+        [[0, 0, 0], [0.42, 0, 0], [0.42, 0.42, 0]],
+        [1, 1, 1],
+        [tuple(pair) for pair in BASE["joint_limits"]],
+        BASE["link_lengths"],
+        [],
+        segment_speed_limits=[[0.6, 1, 1], [1, 0.6, 1]],
+        acceleration_limits=[1, 1, 1],
+        velocity_transition_time=0.2,
+    )
+    assert whole["valid"] is False
+
+    recombined_ok = validate_task(_two_motion_task(wait=0.71))
+    assert recombined_ok["valid"] is True
+
+    recombined_rejected = validate_task(_two_motion_task(wait=0.51))
+    assert recombined_rejected["valid"] is False
+    assert recombined_rejected["unknown_segments"] == []
+
+    starved = _two_motion_task(wait=0.71)
+    starved["segments"][0]["operation"]["pick_events"] = [{"waypoint_index": 0, "object_id": "block"}]
+    starved["segments"][1]["operation"]["carried_objects"] = []
+    result = validate_task(starved)
+    assert result["valid"] is False
+    assert result["unknown_segments"] == [1]
+    assert result["segments"][1]["status"] == "unknown"
+
+
+def test_wait_and_loaded_motion_use_actual_carried_state():
+    task = _two_motion_task(wait=0.71)
+    task["segments"][0]["operation"]["pick_events"] = [{"waypoint_index": 0, "object_id": "block"}]
+    task["segments"][1]["operation"]["place_events"] = [{"waypoint_index": 1, "object_id": "block"}]
+
+    result = validate_task(task)
+
+    assert result["valid"] is True
+    seam = result["seam_checks"][0]
+    assert seam["carried_object_id"] == "block"
+    wait_frames = [frame for frame in result["frames"] if 0.7 < frame["time"] < 1.41]
+    assert wait_frames
+    assert all(frame["carried_object_id"] == "block" for frame in wait_frames)
+    assert all(frame["object_position"] is not None for frame in wait_frames)
+    assert len(result["carried_ranges"]) == 1
+    carried = result["carried_ranges"][0]
+    assert carried["start_time"] == 0.0
+    assert carried["end_time"] == result["duration"]
+
+    abnormal = validate_task(task, failures=[{"segment_index": 0, "type": "pick_failed", "object_id": "block"}])
+    assert abnormal["abnormal"] is not None
+    assert abnormal["abnormal"]["carried_ranges"] == []
+    assert abnormal["unknown_intervals"]
+    assert abnormal["unknown_intervals"][0]["end_time"] == abnormal["duration"]
+
+
+def test_changing_wait_marks_segment_stale_and_reload_revalidates(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "task_store", main.TaskStore(tmp_path))
+    task = TaskDefinition.model_validate(_two_motion_task(wait=0.71))
+
+    saved = main.save_task(task)
+    assert saved.executable is True
+    assert abs(saved.last_task_validation["duration"] - 2.11) < 1e-9
+
+    loaded = main.get_task(saved.id)
+    assert loaded.last_task_validation["stale_segments"] == []
+    assert loaded.last_task_validation["seam_checks"][0]["wait_time"] == 0.71
+
+    sources = saved.last_task_validation["conclusion_sources"]
+    changed = TaskDefinition.model_validate(_two_motion_task(wait=0.51))
+    result = main.run_task_validation(changed, previous=sources)
+    assert {item["segment"] for item in result["stale_segments"]} == {0, 1}
+    assert result["valid"] is False
+
+    unchanged = main.run_task_validation(TaskDefinition.model_validate(_two_motion_task(wait=0.71)), previous=sources)
+    assert unchanged["stale_segments"] == []

@@ -107,7 +107,10 @@ export type SavedProject = Project & {
 export type TaskSegment = {
   segment_id: string;
   name: string;
-  operation: Project;
+  operation: Project | null;
+  wait?: number;
+  wait_before?: number;
+  wait_after?: number;
 };
 
 export type FailureSpec = {
@@ -150,8 +153,12 @@ export type TaskSegmentResult = {
   segment_id: string;
   name: string;
   digest: string;
+  kind?: "motion" | "wait";
   start_time: number;
   end_time: number;
+  wait?: number;
+  wait_before?: number;
+  wait_after?: number;
   handover_in: HandoverState;
   handover_out: HandoverState | null;
   status?: "proven" | "violated" | "unknown";
@@ -178,6 +185,7 @@ export type SeamCheck = {
   between_segment_ids: string[];
   between_names?: string[];
   boundary_time: number;
+  wait_time?: number;
   transition_window_start?: number;
   transition_window_end?: number;
   status: "proven" | "violated" | "unknown";

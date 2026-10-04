@@ -63,7 +63,10 @@ class ValidationRequest(BaseModel):
 class TaskSegment(BaseModel):
     segment_id: str
     name: str = "segment"
-    operation: Project
+    operation: Project | None = None
+    wait: float = Field(default=0.0, ge=0)
+    wait_before: float = Field(default=0.0, ge=0)
+    wait_after: float = Field(default=0.0, ge=0)
 
 
 class FailureSpec(BaseModel):
