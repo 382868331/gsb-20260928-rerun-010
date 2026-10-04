@@ -272,7 +272,8 @@ def _run_chain(segments: list[dict], handover_tolerance: float) -> dict:
     offset = 0.0
     initial: str | None = None
     previous_end_angles: list[float] | None = None
-    previous_motion: dict | None = None
+    last_real_motion: dict | None = None
+    zero_motions: list[dict] = []
     pending_wait = 0.0
     current_angles: list[float] | None = None
 
@@ -322,6 +323,115 @@ def _run_chain(segments: list[dict], handover_tolerance: float) -> dict:
             "entry_velocity": [0.0 for _ in current_angles],
             "exit_velocity": [0.0 for _ in current_angles],
         })
+
+    def evaluate_seam(previous, node, wait_time, joint_angles, carried):
+        dof = len(node["acceleration"])
+        seam_acceleration = np.minimum(previous["acceleration"], node["acceleration"])
+        from_velocity = np.asarray(previous["exit_velocity"], dtype=float)
+        entry_velocity = np.asarray(node["entry_velocity"], dtype=float)
+        transition_time = float(node["transition_time"])
+        joint_results = []
+        violated_joints = []
+        for joint in range(dof):
+            accel_limit = float(seam_acceleration[joint])
+            if wait_time > 0:
+                exit_speed = abs(float(from_velocity[joint]))
+                entry_speed = abs(float(entry_velocity[joint]))
+                if accel_limit > 0:
+                    brake_time = exit_speed / accel_limit
+                    restart_time = entry_speed / accel_limit
+                else:
+                    brake_time = float("inf") if exit_speed > 0 else 0.0
+                    restart_time = float("inf") if entry_speed > 0 else 0.0
+                required_time = brake_time + restart_time
+                allowed_time = wait_time
+                joint_ok = required_time <= allowed_time + 1e-9
+                velocity_change = exit_speed + entry_speed
+            else:
+                velocity_change = abs(float(entry_velocity[joint] - from_velocity[joint]))
+                allowed_time = min(float(previous["transition_time"]), transition_time)
+                required_time = velocity_change / accel_limit if accel_limit > 0 else float("inf")
+                joint_ok = velocity_change <= accel_limit * allowed_time + 1e-9
+            joint_results.append({
+                "joint": joint + 1,
+                "from_velocity": float(from_velocity[joint]),
+                "to_velocity": float(entry_velocity[joint]),
+                "velocity_change": velocity_change,
+                "required_transition_time": required_time,
+                "allowed_transition_time": allowed_time,
+                "acceleration_limit": accel_limit,
+                "ok": joint_ok,
+            })
+            if not joint_ok:
+                violated_joints.append((joint, velocity_change, required_time))
+        seam_status = "violated" if violated_joints else "proven"
+        window_start = (
+            node["boundary_time"] - wait_time
+            if wait_time > 0
+            else node["boundary_time"] - min(float(previous["transition_time"]), transition_time)
+        )
+        window_end = (
+            node["boundary_time"]
+            if wait_time > 0
+            else node["boundary_time"] + min(float(previous["transition_time"]), transition_time)
+        )
+        seam_info = {
+            "between_segments": [previous["index"], node["index"]],
+            "between_segment_ids": [previous["segment_id"], node["segment_id"]],
+            "between_names": [previous["name"], node["name"]],
+            "boundary_time": node["boundary_time"],
+            "transition_window_start": window_start,
+            "transition_window_end": window_end,
+            "wait_time": wait_time,
+            "status": seam_status,
+            "confidence": "boundary",
+            "carried_object_id": carried,
+            "joint_angles": joint_angles,
+            "joints": joint_results,
+        }
+        seam_checks.append(seam_info)
+        for joint, velocity_change, required_time in violated_joints:
+            allowed_time = joint_results[joint]["allowed_transition_time"]
+            if wait_time > 0:
+                message = (
+                    f"joint {joint + 1} must brake {abs(float(from_velocity[joint])):.3f} rad/s to a stop and "
+                    f"re-accelerate to {abs(float(entry_velocity[joint])):.3f} rad/s across the "
+                    f"{wait_time:.3f}s dwell between segments {previous['index'] + 1} ('{previous['name']}') and "
+                    f"{node['index'] + 1} ('{node['name']}') ending at t={node['boundary_time']:.3f}s; "
+                    f"requires {required_time:.3f}s but the dwell provides {wait_time:.3f}s "
+                    f"(acceleration limit {joint_results[joint]['acceleration_limit']:.3f} rad/s^2; "
+                    f"carried object: {carried if carried is not None else 'none'})"
+                )
+            else:
+                message = (
+                    f"joint {joint + 1} velocity changes {velocity_change:.3f} rad/s between "
+                    f"segments {previous['index'] + 1} ('{previous['name']}') and {node['index'] + 1} ('{node['name']}') at t={node['boundary_time']:.3f}s; "
+                    f"requires {required_time:.3f}s but only {allowed_time:.3f}s transition is allowed "
+                    f"(acceleration limit {joint_results[joint]['acceleration_limit']:.3f} rad/s^2; "
+                    f"carried object: {carried if carried is not None else 'none'})"
+                )
+            hazards.append({
+                "start_time": node["boundary_time"] - wait_time if wait_time > 0 else node["boundary_time"],
+                "end_time": node["boundary_time"],
+                "segment": node["index"],
+                "inner_segment": None,
+                "kind": "velocity_transition",
+                "message": message,
+                "confidence": "boundary",
+                "detail": {
+                    "joint": joint + 1,
+                    "from_velocity": float(from_velocity[joint]),
+                    "to_velocity": float(entry_velocity[joint]),
+                    "velocity_change": velocity_change,
+                    "required_transition_time": required_time,
+                    "allowed_transition_time": allowed_time,
+                    "acceleration_limit": joint_results[joint]["acceleration_limit"],
+                    "wait_time": wait_time,
+                    "transition_window_start": window_start,
+                    "transition_window_end": window_end,
+                    "carried_object_id": carried,
+                },
+            })
 
     for item in items:
         if item["kind"] == "wait":
@@ -394,6 +504,7 @@ def _run_chain(segments: list[dict], handover_tolerance: float) -> dict:
         velocities = _operation_velocities(operation, report)
         entry_velocity = velocities[0]
         exit_velocity = velocities[-1]
+        duration = float(report["duration"])
 
         entry_state = {
             "joint_angles": handover_in["joint_angles"],
@@ -401,96 +512,26 @@ def _run_chain(segments: list[dict], handover_tolerance: float) -> dict:
             "entry_velocity": [float(value) for value in entry_velocity],
         }
 
-        if previous_motion is not None:
-            previous = previous_motion
-            seam_acceleration = np.minimum(previous["acceleration"], acceleration)
-            from_velocity = np.asarray(previous["exit_velocity"], dtype=float)
-            wait_time = pending_wait
-            joint_results = []
-            violated_joints = []
-            for joint in range(dof):
-                accel_limit = float(seam_acceleration[joint])
-                if wait_time > 0:
-                    stop_change = max(abs(float(from_velocity[joint])), abs(float(entry_velocity[joint])))
-                    required_time = stop_change / accel_limit if accel_limit > 0 else float("inf")
-                    allowed_time = wait_time
-                    joint_ok = required_time <= allowed_time + 1e-9
-                    velocity_change = stop_change
-                else:
-                    velocity_change = abs(float(entry_velocity[joint] - from_velocity[joint]))
-                    allowed_time = min(previous["transition_time"], transition_time)
-                    required_time = velocity_change / accel_limit if accel_limit > 0 else float("inf")
-                    joint_ok = velocity_change <= accel_limit * allowed_time + 1e-9
-                joint_results.append({
-                    "joint": joint + 1,
-                    "from_velocity": float(from_velocity[joint]),
-                    "to_velocity": float(entry_velocity[joint]),
-                    "velocity_change": velocity_change,
-                    "required_transition_time": required_time,
-                    "allowed_transition_time": allowed_time,
-                    "acceleration_limit": accel_limit,
-                    "ok": joint_ok,
-                })
-                if not joint_ok:
-                    violated_joints.append((joint, velocity_change, required_time))
-            seam_status = "violated" if violated_joints else "proven"
-            seam_info = {
-                "between_segments": [previous["index"], index],
-                "between_segment_ids": [previous["segment_id"], segment_id],
-                "between_names": [previous["name"], name],
-                "boundary_time": offset,
-                "transition_window_start": offset - wait_time if wait_time > 0 else offset - min(previous["transition_time"], transition_time),
-                "transition_window_end": offset if wait_time > 0 else offset + min(previous["transition_time"], transition_time),
-                "wait_time": wait_time,
-                "status": seam_status,
-                "confidence": "boundary",
-                "carried_object_id": initial,
-                "joint_angles": handover_in["joint_angles"],
-                "joints": joint_results,
-            }
-            seam_checks.append(seam_info)
-            for joint, velocity_change, required_time in violated_joints:
-                allowed_time = joint_results[joint]["allowed_transition_time"]
-                if wait_time > 0:
-                    message = (
-                        f"joint {joint + 1} must brake {abs(float(from_velocity[joint])):.3f} rad/s to a stop and "
-                        f"re-accelerate to {abs(float(entry_velocity[joint])):.3f} rad/s across the "
-                        f"{wait_time:.3f}s wait between segments {previous['index'] + 1} ('{previous['name']}') and "
-                        f"{index + 1} ('{name}') ending at t={offset:.3f}s; requires {required_time:.3f}s but the "
-                        f"wait provides {wait_time:.3f}s "
-                        f"(acceleration limit {joint_results[joint]['acceleration_limit']:.3f} rad/s^2; "
-                        f"carried object: {initial if initial is not None else 'none'})"
-                    )
-                else:
-                    message = (
-                        f"joint {joint + 1} velocity changes {velocity_change:.3f} rad/s between "
-                        f"segments {previous['index'] + 1} ('{previous['name']}') and {index + 1} ('{name}') at t={offset:.3f}s; "
-                        f"requires {required_time:.3f}s but only {allowed_time:.3f}s transition is allowed "
-                        f"(acceleration limit {joint_results[joint]['acceleration_limit']:.3f} rad/s^2; "
-                        f"carried object: {initial if initial is not None else 'none'})"
-                    )
-                hazards.append({
-                    "start_time": offset - wait_time if wait_time > 0 else offset,
-                    "end_time": offset,
-                    "segment": index,
-                    "inner_segment": None,
-                    "kind": "velocity_transition",
-                    "message": message,
-                    "confidence": "boundary",
-                    "detail": {
-                        "joint": joint + 1,
-                        "from_velocity": float(from_velocity[joint]),
-                        "to_velocity": float(entry_velocity[joint]),
-                        "velocity_change": velocity_change,
-                        "required_transition_time": required_time,
-                        "allowed_transition_time": allowed_time,
-                        "acceleration_limit": joint_results[joint]["acceleration_limit"],
-                        "wait_time": wait_time,
-                        "transition_window_start": seam_info["transition_window_start"],
-                        "transition_window_end": seam_info["transition_window_end"],
-                        "carried_object_id": initial,
-                    },
-                })
+        node = {
+            "index": index,
+            "segment_id": segment_id,
+            "name": name,
+            "entry_velocity": [float(value) for value in entry_velocity],
+            "exit_velocity": [float(value) for value in exit_velocity],
+            "acceleration": acceleration,
+            "transition_time": transition_time,
+            "boundary_time": offset,
+        }
+        if duration > 0.0:
+            chain = [last_real_motion, *zero_motions] if last_real_motion is not None else []
+            for left, right in zip(chain, [*zero_motions, node]):
+                seam_wait = pending_wait if pending_wait > 0 else 0.0
+                evaluate_seam(left, right, seam_wait, handover_in["joint_angles"], initial)
+            last_real_motion = node
+            zero_motions = []
+            pending_wait = 0.0
+        elif last_real_motion is not None:
+            zero_motions.append(node)
 
         if previous_end_angles is not None:
             mismatch = max(
@@ -539,20 +580,10 @@ def _run_chain(segments: list[dict], handover_tolerance: float) -> dict:
             if item["end_time"] > item["start_time"] + 1e-9
         )
 
-        duration = float(report["duration"])
         handover_out = report["end_state"]
         previous_end_angles = handover_out["joint_angles"]
         initial = handover_out["carried_object_id"]
         current_angles = [float(value) for value in previous_end_angles]
-        previous_motion = {
-            "index": index,
-            "segment_id": segment_id,
-            "name": name,
-            "exit_velocity": [float(value) for value in exit_velocity],
-            "acceleration": acceleration,
-            "transition_time": transition_time,
-        }
-        pending_wait = 0.0
         per_segment.append({
             "segment_id": segment_id,
             "name": name,

@@ -470,7 +470,7 @@ def test_standalone_wait_segment_matches_attached_wait():
     assert proven[0]["wait_time"] == 0.71
 
 
-def test_split_wait_around_zero_length_motion_gains_no_extra_budget():
+def test_split_wait_around_zero_length_motion_pools_into_one_budget():
     task = _two_motion_task(wait=0.36)
     task["segments"].insert(1, {
         "segment_id": "zero",
@@ -480,10 +480,75 @@ def test_split_wait_around_zero_length_motion_gains_no_extra_budget():
     })
     result = validate_task(task)
 
-    assert result["valid"] is False
+    assert result["valid"] is True
     budgets = [seam["wait_time"] for seam in result["seam_checks"]]
-    assert budgets == [0.36, 0.35]
-    assert all(seam["status"] == "violated" for seam in result["seam_checks"])
+    assert budgets == [0.71, 0.71]
+    assert all(seam["status"] == "proven" for seam in result["seam_checks"])
+
+
+def test_pooled_wait_below_required_time_still_rejected():
+    task = _two_motion_task(wait=0.2)
+    task["segments"].insert(1, {
+        "segment_id": "zero",
+        "name": "zero-length",
+        "operation": _single_axis_operation([[0.42, 0, 0], [0.42, 0, 0]], [1, 1, 1]),
+        "wait_after": 0.31,
+    })
+    result = validate_task(task)
+
+    assert result["valid"] is False
+    assert [seam["wait_time"] for seam in result["seam_checks"]] == [0.51, 0.51]
+    assert result["seam_checks"][0]["status"] == "violated"
+    hazard = next(item for item in result["hazards"] if item["kind"] == "velocity_transition")
+    assert abs(hazard["detail"]["required_transition_time"] - 0.6) < 1e-9
+    assert hazard["detail"]["allowed_transition_time"] == 0.51
+
+
+def test_reverse_velocity_wait_requires_brake_and_restart_sum():
+    def reverse_op(waypoints):
+        return {
+            "waypoints": waypoints,
+            "speed_limits": [1.0],
+            "joint_limits": [[-3.14, 3.14]],
+            "link_lengths": [1.0],
+            "acceleration_limits": [2.0],
+            "velocity_transition_time": 0.3,
+            "pick_events": [],
+            "place_events": [],
+        }
+
+    def reverse_task(wait):
+        return {"name": "reverse", "segments": [
+            {"segment_id": "out", "name": "out",
+             "operation": reverse_op([[0.0], [0.7]]), "wait_after": wait},
+            {"segment_id": "back", "name": "back",
+             "operation": reverse_op([[0.7], [0.0]])},
+        ]}
+
+    rejected = validate_task(reverse_task(0.51))
+    assert rejected["valid"] is False
+    hazard = next(item for item in rejected["hazards"] if item["kind"] == "velocity_transition")
+    assert hazard["detail"]["from_velocity"] == 1.0
+    assert hazard["detail"]["to_velocity"] == -1.0
+    assert hazard["detail"]["velocity_change"] == 2.0
+    assert abs(hazard["detail"]["required_transition_time"] - 1.0) < 1e-9
+    assert hazard["detail"]["allowed_transition_time"] == 0.51
+
+    borderline = validate_task(reverse_task(0.71))
+    assert borderline["valid"] is False
+    borderline_hazard = next(item for item in borderline["hazards"] if item["kind"] == "velocity_transition")
+    assert abs(borderline_hazard["detail"]["required_transition_time"] - 1.0) < 1e-9
+    assert borderline_hazard["detail"]["allowed_transition_time"] == 0.71
+
+    accepted = validate_task(reverse_task(1.0))
+    assert accepted["valid"] is True
+    seam = accepted["seam_checks"][0]
+    joint = seam["joints"][0]
+    assert joint["from_velocity"] == 1.0
+    assert joint["to_velocity"] == -1.0
+    assert joint["velocity_change"] == 2.0
+    assert abs(joint["required_transition_time"] - 1.0) < 1e-9
+    assert joint["allowed_transition_time"] == 1.0
 
 
 def test_adjacent_wait_pieces_merge_into_one_contiguous_dwell():
