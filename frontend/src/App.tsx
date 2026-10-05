@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, CheckCircle2, Pause, Play, RotateCcw, Save, ScanSearch } from "lucide-react";
-import { getProject, getTask, listProjects, listTasks, saveProject, saveTask, updateProject, updateTask, validateProject, validateProjectSegments, validateTask } from "./api";
+import { createWaitRevision, getProject, getTask, listProjects, listTasks, planWaitAllocation, saveProject, saveTask, updateProject, updateTask, validateProject, validateProjectSegments, validateTask } from "./api";
 import { defaultProject } from "./defaults";
 import RobotScene from "./RobotScene";
-import type { CarryEvent, FailureSpec, Frame, Project, SavedProject, SavedTask, TaskDefinition, TaskFrame, TaskResult, ValidationResult } from "./types";
+import type { CarryEvent, FailureSpec, Frame, Project, SavedProject, SavedTask, TaskDefinition, TaskFrame, TaskResult, ValidationResult, WaitPlanResult, WaitSchemeKey } from "./types";
 
 const cloneProject = (project: Project): Project => JSON.parse(JSON.stringify(project));
 
@@ -55,6 +55,16 @@ export default function App() {
   const [currentTaskId, setCurrentTaskId] = useState<string | null>(null);
   const [waitCompare, setWaitCompare] = useState({ boundary: 0, short: 0.51, enough: 0.71 });
   const [waitComparison, setWaitComparison] = useState<{ label: string; wait: number; result: TaskResult }[] | null>(null);
+  const [waitPlanConfig, setWaitPlanConfig] = useState<{ allowed: number[]; locked: string; maxDuration: string }>({ allowed: [], locked: "", maxDuration: "" });
+  const [waitPlan, setWaitPlan] = useState<WaitPlanResult | null>(null);
+
+  useEffect(() => {
+    setWaitPlanConfig((current) => ({
+      ...current,
+      allowed: Array.from({ length: Math.max(0, task.segments.length - 1) }, (_, index) => index),
+    }));
+    setWaitPlan(null);
+  }, [task.segments.length]);
 
   const activeTaskPlan = taskMode && taskResult ? (abnormalView && taskResult.abnormal ? taskResult.abnormal : taskResult) : null;
   const viewFrames: Frame[] = activeTaskPlan ? activeTaskPlan.frames : result?.frames ?? [];
@@ -344,6 +354,49 @@ export default function App() {
     setSavedTasks(await listTasks());
     await loadTask(saved.id);
     setMessage(saved.executable ? `任务已保存并重开校验通过：${saved.name}` : `任务已保存并重开校验：${saved.name}（仍不可执行）`);
+  };
+
+  const waitPlanInputs = () => {
+    const locked = waitPlanConfig.locked
+      .split(/[,，\s]+/)
+      .filter(Boolean)
+      .map((value) => Number(value) - 1);
+    const maxDuration = waitPlanConfig.maxDuration.trim() === "" ? null : Number(waitPlanConfig.maxDuration);
+    return { locked, maxDuration };
+  };
+
+  const computeWaitPlan = async () => {
+    setMessage("");
+    try {
+      const { locked, maxDuration } = waitPlanInputs();
+      const plan = await planWaitAllocation(task, waitPlanConfig.allowed, locked, maxDuration);
+      setWaitPlan(plan);
+      if (!plan.feasible) {
+        setMessage("无可行等待分配：请查看具体接缝与不足时间");
+      }
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "等待分配计算失败");
+    }
+  };
+
+  const approveWaitPlan = async (scheme: WaitSchemeKey) => {
+    if (!currentTaskId) {
+      setMessage("请先保存任务；批准后修订会生成为独立任务，原计划不变");
+      return;
+    }
+    setMessage("");
+    try {
+      const { locked, maxDuration } = waitPlanInputs();
+      const response = await createWaitRevision(currentTaskId, waitPlanConfig.allowed, locked, maxDuration, scheme);
+      setSavedTasks(await listTasks());
+      setMessage(
+        response.revision.executable
+          ? `已生成独立任务修订：${response.revision.name}（可执行，总时长 ${response.revision.last_task_validation?.duration.toFixed(2) ?? "--"}s），原计划不变`
+          : `已生成独立任务修订：${response.revision.name}（仍不可执行），原计划不变`,
+      );
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "生成等待修订失败");
+    }
   };
 
   const taskObjectOptions = useMemo(() => {
@@ -746,6 +799,94 @@ export default function App() {
               ))}
               <button onClick={() => applyWaitToTask(waitCompare.enough)}>应用足够等待到任务</button>
               <button onClick={persistTaskAndReload}>保存并重开后重新校验</button>
+            </div>
+          )}
+
+          <h2>等待分配（受限总时长）</h2>
+          <div className="limit-row">
+            <span>允许停留接缝</span>
+            {task.segments.slice(0, -1).map((segment, index) => (
+              <label key={segment.segment_id}>
+                <input
+                  type="checkbox"
+                  checked={waitPlanConfig.allowed.includes(index)}
+                  onChange={(event) =>
+                    setWaitPlanConfig((current) => ({
+                      ...current,
+                      allowed: event.target.checked
+                        ? [...current.allowed, index].sort((a, b) => a - b)
+                        : current.allowed.filter((boundary) => boundary !== index),
+                    }))
+                  }
+                />
+                段{index + 1}→段{index + 2}
+              </label>
+            ))}
+          </div>
+          <div className="limit-row">
+            <label className="single-input">不可移动动作（段号，逗号分隔）
+              <input
+                value={waitPlanConfig.locked}
+                placeholder="如 2,4"
+                onChange={(event) => setWaitPlanConfig({ ...waitPlanConfig, locked: event.target.value })}
+              />
+            </label>
+            <label className="single-input">任务完成上限 s（可空）
+              <input
+                value={waitPlanConfig.maxDuration}
+                placeholder="不限"
+                onChange={(event) => setWaitPlanConfig({ ...waitPlanConfig, maxDuration: event.target.value })}
+              />
+            </label>
+          </div>
+          <button onClick={computeWaitPlan} disabled={task.segments.length < 2}>
+            计算等待分配
+          </button>
+          {waitPlan && (
+            <div className="message">
+              <div>
+                当前总时长 {waitPlan.baseline_duration.toFixed(2)}s
+                {waitPlan.max_duration != null && `，完成上限 ${waitPlan.max_duration.toFixed(2)}s`}
+                ，必需新增等待 {waitPlan.total_added_time.toFixed(2)}s
+              </div>
+              {waitPlan.pools.map((pool, poolIndex) => (
+                <div key={poolIndex}>
+                  接缝 {pool.between_names.join(" → ")}：需停留 {pool.required_dwell?.toFixed(2) ?? "--"}s
+                  ，已有 {pool.existing_wait.toFixed(2)}s，缺口 {(pool.deficit ?? 0).toFixed(2)}s
+                  {pool.forbidden_boundaries.length > 0 &&
+                    `，禁止停留区 ${pool.forbidden_boundaries.map((boundary) => `段${boundary + 1}后`).join("、")} 不可用于填补`}
+                </div>
+              ))}
+              {!waitPlan.feasible &&
+                waitPlan.infeasible.map((entry, index) => (
+                  <div key={index}>
+                    无可行分配：接缝 {entry.seam.between_names.join(" → ")}
+                    {entry.shortfall != null && `，不足 ${entry.shortfall.toFixed(2)}s`}（{entry.reason}）
+                  </div>
+                ))}
+              {waitPlan.feasible && ([
+                ["shortest_completion", "最短完成"],
+                ["fewest_new_stops", "最少新增停顿"],
+              ] as [WaitSchemeKey, string][]).map(([key, label]) => {
+                const scheme = waitPlan.schemes[key];
+                if (!scheme) return null;
+                return (
+                  <div key={key}>
+                    {label}：新增等待 {scheme.added_time.toFixed(2)}s，总时长 {scheme.new_duration.toFixed(2)}s
+                    ，新增停顿 {scheme.new_stops} 处
+                    {scheme.placements.map((placement, placementIndex) => (
+                      <span key={placementIndex}>
+                        {`；段${placement.boundary + 1}后 +${placement.added.toFixed(2)}s（${placement.between_names.join(" → ")}）`}
+                      </span>
+                    ))}
+                    ，核验{scheme.validation.valid ? "通过" : "未通过"}
+                    <button onClick={() => approveWaitPlan(key)} disabled={!currentTaskId}>
+                      批准并生成独立任务修订
+                    </button>
+                  </div>
+                );
+              })}
+              {waitPlan.feasible && !currentTaskId && <div>批准前请先保存任务；修订生成为独立任务，原计划不变。</div>}
             </div>
           )}
 

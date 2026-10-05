@@ -270,3 +270,60 @@ export type SavedTask = TaskDefinition & {
   last_task_validation: TaskResult | null;
   validation_error: string | null;
 };
+
+export type WaitPlacement = {
+  boundary: number;
+  segment_index: number;
+  field: "wait" | "wait_after";
+  added: number;
+  between_segment_ids: string[];
+  between_names: string[];
+};
+
+export type WaitPool = {
+  left_segment: number;
+  right_segment: number;
+  between_segments: number[];
+  between_segment_ids: string[];
+  between_names: string[];
+  existing_wait: number;
+  required_dwell: number | null;
+  deficit: number | null;
+  no_wait_ok: boolean;
+  usable_boundaries: number[];
+  forbidden_boundaries: number[];
+};
+
+export type WaitSchemeKey = "shortest_completion" | "fewest_new_stops";
+
+export type WaitScheme = {
+  placements: WaitPlacement[];
+  added_time: number;
+  new_duration: number;
+  new_stops: number;
+  stops: number;
+  validation: { valid: boolean; duration: number | null; error?: string };
+};
+
+export type WaitPlanResult = {
+  feasible: boolean;
+  baseline_duration: number;
+  max_duration: number | null;
+  allowed_seams: number[];
+  locked_segments: number[];
+  total_added_time: number;
+  pools: WaitPool[];
+  infeasible: {
+    seam: { between_segments: number[]; between_segment_ids: string[]; between_names: string[] };
+    shortfall: number | null;
+    reason: string;
+  }[];
+  schemes: Partial<Record<WaitSchemeKey, WaitScheme>>;
+  constraint_version: string;
+};
+
+export type WaitRevisionResponse = {
+  plan: WaitPlanResult;
+  scheme: WaitSchemeKey;
+  revision: SavedTask;
+};

@@ -6,9 +6,19 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from .robotics import validate_motion
-from .schemas import Project, SavedProject, SavedTask, TaskDefinition, TaskValidationRequest, ValidationRequest
+from .schemas import (
+    Project,
+    SavedProject,
+    SavedTask,
+    TaskDefinition,
+    TaskValidationRequest,
+    ValidationRequest,
+    WaitPlanRequest,
+    WaitRevisionRequest,
+)
 from .storage import ProjectStore, TaskStore
 from .taskchain import validate_task
+from .waitplan import analyze_wait_allocation, build_wait_revision
 
 app = FastAPI(title="Offline Robot Programming Platform", version="0.1.0")
 app.add_middleware(
@@ -288,3 +298,41 @@ def replay_task(task_id: str) -> dict:
     if saved.last_task_validation is None:
         return {"valid": False, "error": saved.validation_error}
     return saved.last_task_validation
+
+
+@app.post("/api/task/wait-plan", response_model=dict)
+def plan_wait_allocation(request: WaitPlanRequest) -> dict:
+    try:
+        return analyze_wait_allocation(
+            request.task.model_dump(),
+            allowed_seams=request.allowed_seams,
+            locked_segments=request.locked_segments,
+            max_duration=request.max_duration,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/tasks/{task_id}/wait-revisions", response_model=dict)
+def create_wait_revision(task_id: str, request: WaitRevisionRequest) -> dict:
+    try:
+        saved = task_store.get(task_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="task not found") from exc
+    task = TaskDefinition.model_validate(
+        saved.model_dump(exclude={"id", "executable", "validation_digest", "last_task_validation", "validation_error"})
+    )
+    try:
+        plan = analyze_wait_allocation(
+            task.model_dump(),
+            allowed_seams=request.allowed_seams,
+            locked_segments=request.locked_segments,
+            max_duration=request.max_duration,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not plan["feasible"]:
+        raise HTTPException(status_code=400, detail={"message": "no feasible wait allocation", "infeasible": plan["infeasible"]})
+    revision = TaskDefinition.model_validate(build_wait_revision(task.model_dump(), plan, request.scheme))
+    saved_revision = save_validated_task(revision)
+    return {"plan": plan, "scheme": request.scheme, "revision": saved_revision.model_dump()}

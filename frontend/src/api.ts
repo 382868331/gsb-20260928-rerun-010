@@ -1,4 +1,4 @@
-import type { Project, SavedProject, SavedTask, TaskDefinition, TaskResult, ValidationResult } from "./types";
+import type { Project, SavedProject, SavedTask, TaskDefinition, TaskResult, ValidationResult, WaitPlanResult, WaitRevisionResponse, WaitSchemeKey } from "./types";
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -63,3 +63,36 @@ export const updateTask = (id: string, task: TaskDefinition) =>
 export const listTasks = () => request<SavedTask[]>("/api/tasks");
 
 export const getTask = (id: string) => request<SavedTask>(`/api/tasks/${id}`);
+
+export const planWaitAllocation = (
+  task: TaskDefinition,
+  allowedSeams: number[],
+  lockedSegments: number[],
+  maxDuration: number | null,
+) =>
+  request<WaitPlanResult>("/api/task/wait-plan", {
+    method: "POST",
+    body: JSON.stringify({
+      task,
+      allowed_seams: allowedSeams,
+      locked_segments: lockedSegments,
+      max_duration: maxDuration,
+    }),
+  });
+
+export const createWaitRevision = (
+  id: string,
+  allowedSeams: number[],
+  lockedSegments: number[],
+  maxDuration: number | null,
+  scheme: WaitSchemeKey,
+) =>
+  request<WaitRevisionResponse>(`/api/tasks/${id}/wait-revisions`, {
+    method: "POST",
+    body: JSON.stringify({
+      allowed_seams: allowedSeams,
+      locked_segments: lockedSegments,
+      max_duration: maxDuration,
+      scheme,
+    }),
+  });

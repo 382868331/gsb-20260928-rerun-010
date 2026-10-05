@@ -95,3 +95,17 @@ class SavedTask(TaskDefinition):
 class TaskValidationRequest(BaseModel):
     task: TaskDefinition
     previous: dict | None = None
+
+
+class WaitPlanRequest(BaseModel):
+    task: TaskDefinition
+    allowed_seams: list[int] = []
+    locked_segments: list[int] = []
+    max_duration: float | None = Field(default=None, gt=0)
+
+
+class WaitRevisionRequest(BaseModel):
+    allowed_seams: list[int] = []
+    locked_segments: list[int] = []
+    max_duration: float | None = Field(default=None, gt=0)
+    scheme: Literal["shortest_completion", "fewest_new_stops"] = "fewest_new_stops"
