@@ -1,4 +1,4 @@
-import type { Project, SavedProject, SavedTask, TaskDefinition, TaskResult, ValidationResult } from "./types";
+import type { Project, SavedProject, SavedTask, TaskDefinition, TaskResult, ValidationResult, WaitPlanResult } from "./types";
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -46,6 +46,15 @@ export const validateTask = (task: TaskDefinition, previous: unknown | null) =>
   request<TaskResult>("/api/task/validate", {
     method: "POST",
     body: JSON.stringify({ task, previous }),
+  });
+
+export const planTaskWaits = (
+  task: TaskDefinition,
+  payload: { max_total_duration: number | null; allowed_seams: number[][]; immovable_segments: number[]; approve: boolean },
+) =>
+  request<WaitPlanResult>("/api/task/wait-plan", {
+    method: "POST",
+    body: JSON.stringify({ task, ...payload }),
   });
 
 export const saveTask = (task: TaskDefinition) =>

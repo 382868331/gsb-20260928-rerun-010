@@ -6,9 +6,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from .robotics import validate_motion
-from .schemas import Project, SavedProject, SavedTask, TaskDefinition, TaskValidationRequest, ValidationRequest
+from .schemas import Project, SavedProject, SavedTask, TaskDefinition, TaskValidationRequest, ValidationRequest, WaitAllocationRequest
 from .storage import ProjectStore, TaskStore
-from .taskchain import validate_task
+from .taskchain import plan_wait_allocation, validate_task
 
 app = FastAPI(title="Offline Robot Programming Platform", version="0.1.0")
 app.add_middleware(
@@ -229,6 +229,23 @@ def replay_project(project_id: str) -> dict:
 def validate_chained_task(request: TaskValidationRequest) -> dict:
     try:
         return run_task_validation(request.task, previous=request.previous)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/task/wait-plan", response_model=dict)
+def plan_task_waits(request: WaitAllocationRequest) -> dict:
+    for pair in request.allowed_seams:
+        if len(pair) != 2:
+            raise HTTPException(status_code=400, detail="allowed_seams entries must be [left_index, right_index]")
+    payload = {
+        "max_total_duration": request.max_total_duration,
+        "allowed_seams": request.allowed_seams,
+        "immovable_segments": request.immovable_segments,
+        "approve": request.approve,
+    }
+    try:
+        return plan_wait_allocation(request.task.model_dump(), payload)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

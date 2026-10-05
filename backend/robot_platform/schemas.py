@@ -95,3 +95,19 @@ class SavedTask(TaskDefinition):
 class TaskValidationRequest(BaseModel):
     task: TaskDefinition
     previous: dict | None = None
+
+
+class WaitAllocationRequest(BaseModel):
+    task: TaskDefinition
+    max_total_duration: float | None = Field(default=None, ge=0)
+    allowed_seams: list[list[int]] = []
+    immovable_segments: list[int] = []
+    approve: bool = False
+
+
+class WaitAllocationRequest(BaseModel):
+    task: TaskDefinition
+    max_total_duration: float | None = Field(default=None, ge=0)
+    allowed_seams: list[list[int]] = []
+    immovable_segments: list[int] = []
+    approve: bool = False

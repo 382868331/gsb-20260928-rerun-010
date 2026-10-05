@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, CheckCircle2, Pause, Play, RotateCcw, Save, ScanSearch } from "lucide-react";
-import { getProject, getTask, listProjects, listTasks, saveProject, saveTask, updateProject, updateTask, validateProject, validateProjectSegments, validateTask } from "./api";
+import { getProject, getTask, listProjects, listTasks, planTaskWaits, saveProject, saveTask, updateProject, updateTask, validateProject, validateProjectSegments, validateTask } from "./api";
 import { defaultProject } from "./defaults";
 import RobotScene from "./RobotScene";
-import type { CarryEvent, FailureSpec, Frame, Project, SavedProject, SavedTask, TaskDefinition, TaskFrame, TaskResult, ValidationResult } from "./types";
+import type { CarryEvent, FailureSpec, Frame, Project, SavedProject, SavedTask, TaskDefinition, TaskFrame, TaskResult, ValidationResult, WaitPlanResult } from "./types";
 
 const cloneProject = (project: Project): Project => JSON.parse(JSON.stringify(project));
 
@@ -55,6 +55,7 @@ export default function App() {
   const [currentTaskId, setCurrentTaskId] = useState<string | null>(null);
   const [waitCompare, setWaitCompare] = useState({ boundary: 0, short: 0.51, enough: 0.71 });
   const [waitComparison, setWaitComparison] = useState<{ label: string; wait: number; result: TaskResult }[] | null>(null);
+  const [waitPlanner, setWaitPlanner] = useState({ cap: 0, allowedSeamText: "0,1", immovableText: "", plan: null as WaitPlanResult | null });
 
   const activeTaskPlan = taskMode && taskResult ? (abnormalView && taskResult.abnormal ? taskResult.abnormal : taskResult) : null;
   const viewFrames: Frame[] = activeTaskPlan ? activeTaskPlan.frames : result?.frames ?? [];
@@ -336,6 +337,42 @@ export default function App() {
   const applyWaitToTask = (wait: number) => {
     const boundary = Math.min(waitCompare.boundary, Math.max(0, task.segments.length - 2));
     updateSegmentWait(boundary, "wait_after", wait);
+  };
+
+  const parseSeamPairs = (text: string): number[][] =>
+    text
+      .split(/[;；\s]+/)
+      .map((part) => part.trim())
+      .filter(Boolean)
+      .map((part) => part.split(/[,，\-]/).map((value) => Number(value.trim())))
+      .filter((pair) => pair.length === 2 && pair.every(Number.isFinite));
+
+  const parseIndexList = (text: string): number[] =>
+    text
+      .split(/[,，;；\s]+/)
+      .map((part) => Number(part.trim()))
+      .filter((value) => Number.isFinite(value))
+      .map((value) => value - 1);
+
+  const runWaitPlanner = async (approve: boolean) => {
+    setMessage("");
+    try {
+      const plan = await planTaskWaits(task, {
+        max_total_duration: waitPlanner.cap > 0 ? waitPlanner.cap : null,
+        allowed_seams: parseSeamPairs(waitPlanner.allowedSeamText),
+        immovable_segments: parseIndexList(waitPlanner.immovableText),
+        approve,
+      });
+      setWaitPlanner((current) => ({ ...current, plan }));
+      if (!plan.feasible) {
+        setMessage("等待分配不可行，见下方具体接缝与不足时间");
+      } else if (approve && plan.revision_validation) {
+        setTask(plan.revision as TaskDefinition);
+        setMessage(`已生成独立任务修订（原计划不变）：${plan.revision_validation.valid ? "核验通过" : "核验未通过"}`);
+      }
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "等待分配失败");
+    }
   };
 
   const persistTaskAndReload = async () => {
@@ -746,6 +783,75 @@ export default function App() {
               ))}
               <button onClick={() => applyWaitToTask(waitCompare.enough)}>应用足够等待到任务</button>
               <button onClick={persistTaskAndReload}>保存并重开后重新校验</button>
+            </div>
+          )}
+
+          <h2>受限总时长等待分配</h2>
+          <div className="limit-row">
+            <label className="single-input">完成上限 s（0 表示不限）
+              <NumberInput value={waitPlanner.cap} step={0.1} onChange={(next) => setWaitPlanner({ ...waitPlanner, cap: Math.max(0, next) })} />
+            </label>
+            <label className="single-input">不可移动动作（段号，逗号分隔）
+              <input
+                value={waitPlanner.immovableText}
+                onChange={(event) => setWaitPlanner({ ...waitPlanner, immovableText: event.target.value })}
+                placeholder="如 2" />
+            </label>
+          </div>
+          <label className="single-input">允许停留接缝（用“左段,右段”，1 起始；多对用空格或分号分隔）
+            <input
+              value={waitPlanner.allowedSeamText}
+              onChange={(event) => setWaitPlanner({ ...waitPlanner, allowedSeamText: event.target.value })}
+              placeholder="如 1,2; 2,3" />
+          </label>
+          <div className="limit-row">
+            <button onClick={() => runWaitPlanner(false)} disabled={task.segments.length < 2}>比较方案</button>
+            <button onClick={() => runWaitPlanner(true)} disabled={task.segments.length < 2}>批准并生成独立修订</button>
+          </div>
+          {waitPlanner.plan && (
+            <div className="message">
+              <div>
+                基础总时长 {waitPlanner.plan.base_duration.toFixed(3)}s；
+                最短完成方案总时长 {waitPlanner.plan.shortest_completion.planned_duration.toFixed(3)}s、
+                新增停顿 {waitPlanner.plan.shortest_completion.new_pause_count} 处、
+                新增等待 {waitPlanner.plan.shortest_completion.total_added_wait.toFixed(3)}s；
+                最少新增停顿方案与最短完成方案{waitPlanner.plan.comparison.equivalent ? "等价" : "不同"}。
+              </div>
+              {waitPlanner.plan.shortest_completion.allocations.map((allocation) => (
+                <div key={allocation.between_segments.join("-")}>
+                  段{allocation.between_segments[0] + 1} → 段{allocation.between_segments[1] + 1}：
+                  已有 {allocation.existing_wait.toFixed(3)}s / 需要 {allocation.required_wait.toFixed(3)}s /
+                  分配新增 {allocation.added_wait.toFixed(3)}s
+                  {allocation.allowed ? "" : "；禁止停留"}
+                  {allocation.immovable_blocked ? "；受不可移动动作阻挡" : ""}
+                  {allocation.seams.map((seam) => (
+                    <div key={seam.between_segments.join("-")} style={{ paddingLeft: 12 }}>
+                      接缝 {seam.between_segment_ids.join(" → ")}：刹车+反向加速共需 {seam.required_dwell_time.toFixed(3)}s
+                      {seam.no_wait_transition_ok ? "（无等待也可直接过渡）" : ""}
+                    </div>
+                  ))}
+                </div>
+              ))}
+              {waitPlanner.plan.infeasible.length > 0 && (
+                <div style={{ color: "#b00020" }}>
+                  {waitPlanner.plan.infeasible.map((issue, index) => (
+                    <div key={index}>
+                      {issue.seam
+                        ? `接缝 段${issue.seam[0] + 1} → 段${issue.seam[1] + 1}`
+                        : "任务完成上限"}
+                      {issue.between_segment_ids ? `（${issue.between_segment_ids.join(" → ")}）` : ""}：
+                      {issue.reason}；不足 {issue.shortage_time.toFixed(3)}s
+                      {issue.required_duration != null ? `（需要 ${issue.required_duration.toFixed(3)}s）` : ""}
+                    </div>
+                  ))}
+                </div>
+              )}
+              {waitPlanner.plan.revision_validation && (
+                <div>
+                  修订核验：{waitPlanner.plan.revision_validation.valid ? "通过" : "未通过"}，
+                  总时长 {waitPlanner.plan.revision_validation.duration.toFixed(3)}s（原计划保持不变）
+                </div>
+              )}
             </div>
           )}
 

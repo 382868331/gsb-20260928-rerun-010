@@ -270,3 +270,58 @@ export type SavedTask = TaskDefinition & {
   last_task_validation: TaskResult | null;
   validation_error: string | null;
 };
+
+export type WaitPlanIssue = {
+  seam: number[] | null;
+  between_segment_ids?: string[];
+  between_names?: string[];
+  shortage_time: number;
+  existing_wait?: number;
+  required_wait?: number;
+  required_duration?: number;
+  max_total_duration?: number;
+  blocked_segments?: number[];
+  reason: string;
+};
+
+export type WaitPlanSolution = {
+  label: string;
+  total_added_wait: number;
+  new_pause_count: number;
+  planned_duration: number;
+  allocations: {
+    between_segments: number[];
+    existing_wait: number;
+    required_wait: number;
+    added_wait: number;
+    allowed: boolean;
+    immovable_blocked: boolean;
+    seams: {
+      between_segments: number[];
+      between_segment_ids: string[];
+      between_names: string[];
+      required_dwell_time: number;
+      no_wait_transition_ok: boolean;
+    }[];
+  }[];
+};
+
+export type WaitPlanResult = {
+  feasible: boolean;
+  base_duration: number;
+  motion_duration: number;
+  existing_total_wait: number;
+  max_total_duration: number | null;
+  shortest_completion: WaitPlanSolution;
+  fewest_new_pauses: WaitPlanSolution;
+  comparison: {
+    equivalent: boolean;
+    reason: string;
+    shortest_completion_duration: number;
+    fewest_new_pauses_duration: number;
+    new_pause_count: number;
+  };
+  infeasible: WaitPlanIssue[];
+  revision: TaskDefinition | null;
+  revision_validation: TaskResult | null;
+};

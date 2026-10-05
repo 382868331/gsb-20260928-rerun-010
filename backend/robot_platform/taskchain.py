@@ -11,6 +11,7 @@ from .robotics import carried_object_pose, forward_kinematics
 
 DEFAULT_HANDOVER_TOLERANCE = 1e-6
 REPLAY_PAD = 0.02
+EPS = 1e-9
 
 
 def operation_digest(
@@ -799,3 +800,298 @@ def validate_task(
         },
         "collision_check_dt": COLLISION_CHECK_DT,
     }
+
+
+def _motion_segments(segments: list[dict]) -> dict[int, dict]:
+    """Run each motion operation once and return velocity/duration/constraint info."""
+    profiles: dict[int, dict] = {}
+    initial: str | None = None
+    for index, segment in enumerate(segments):
+        operation = segment.get("operation")
+        if operation is None:
+            continue
+        try:
+            report = _run_segment(operation, initial)
+        except ValueError as exc:
+            raise ValueError(
+                f"segment {index + 1} ('{segment.get('name', segment.get('segment_id', index + 1))}') "
+                f"cannot provide entry/exit velocities: {exc}"
+            ) from exc
+        dof = len(operation["link_lengths"])
+        acceleration, transition_time = _segment_constraints(operation, dof)
+        velocities = _operation_velocities(operation, report)
+        duration = float(report["duration"])
+        carried_out = report.get("end_state", {}).get("carried_object_id") if report.get("end_state") else initial
+        profiles[index] = {
+            "index": index,
+            "segment_id": segment.get("segment_id", f"segment-{index + 1}"),
+            "name": segment.get("name", segment.get("segment_id", f"segment-{index + 1}")),
+            "entry_velocity": [float(value) for value in velocities[0]],
+            "exit_velocity": [float(value) for value in velocities[-1]],
+            "acceleration": acceleration,
+            "transition_time": transition_time,
+            "duration": duration,
+            "carried_in": initial,
+            "carried_out": carried_out,
+        }
+        initial = carried_out
+    return profiles
+
+
+def _seam_required_times(profiles: dict[int, dict], left_index: int, right_index: int) -> list[dict]:
+    left = profiles[left_index]
+    right = profiles[right_index]
+    seam_acceleration = np.minimum(left["acceleration"], right["acceleration"])
+    from_velocity = np.asarray(left["exit_velocity"], dtype=float)
+    entry_velocity = np.asarray(right["entry_velocity"], dtype=float)
+    joints = []
+    for joint, accel_limit_array in enumerate(seam_acceleration):
+        accel_limit = float(accel_limit_array)
+        exit_speed = abs(float(from_velocity[joint]))
+        entry_speed = abs(float(entry_velocity[joint]))
+        brake_time = exit_speed / accel_limit if accel_limit > 0 else (float("inf") if exit_speed > 0 else 0.0)
+        restart_time = entry_speed / accel_limit if accel_limit > 0 else (float("inf") if entry_speed > 0 else 0.0)
+        dwell_time = brake_time + restart_time
+        allowed_no_wait = min(float(left["transition_time"]), float(right["transition_time"]))
+        no_wait_change = abs(float(entry_velocity[joint] - from_velocity[joint]))
+        no_wait_ok = no_wait_change <= accel_limit * allowed_no_wait + EPS if accel_limit > 0 else False
+        joints.append({
+            "joint": joint + 1,
+            "from_velocity": float(from_velocity[joint]),
+            "to_velocity": float(entry_velocity[joint]),
+            "acceleration_limit": accel_limit,
+            "brake_time": brake_time,
+            "restart_time": restart_time,
+            "required_dwell_time": dwell_time,
+            "no_wait_transition_ok": bool(no_wait_ok),
+            "carried_object_id": left.get("carried_out"),
+        })
+    return joints
+
+
+def _wait_gaps(segments: list[dict], profiles: dict[int, dict]) -> list[dict]:
+    """Group consecutive real-motion blocks separated only by waits/zero-length motions."""
+    real_indices = [index for index, profile in profiles.items() if profile["duration"] > 0.0]
+    gaps = []
+    for position, right_index in enumerate(real_indices[1:], start=1):
+        left_index = real_indices[position - 1]
+        between = list(range(left_index + 1, right_index + 1))
+        motion_between = [index for index in between if index in profiles]
+        if any(profiles[index]["duration"] > 0.0 for index in motion_between[:-1]):
+            continue
+        existing_wait = 0.0
+        wait_sources: list[tuple[int, str]] = []
+        for index in range(left_index, right_index + 1):
+            if index >= len(segments):
+                continue
+            segment = segments[index]
+            if segment.get("operation") is None:
+                wait_value = float(segment.get("wait") or 0.0)
+                existing_wait += wait_value
+                if wait_value > EPS:
+                    wait_sources.append((index, "wait"))
+                continue
+            wait_before = float(segment.get("wait_before") or 0.0)
+            wait_after = float(segment.get("wait_after") or 0.0)
+            counted_before = wait_before if left_index < index <= right_index else 0.0
+            counted_after = wait_after if left_index <= index < right_index else 0.0
+            existing_wait += counted_before + counted_after
+            if counted_before > EPS:
+                wait_sources.append((index, "wait_before"))
+            if counted_after > EPS:
+                wait_sources.append((index, "wait_after"))
+        seam_chains = [(left_index, motion_between[0])] if motion_between else []
+        seam_chains.extend((motion_between[k], motion_between[k + 1]) for k in range(len(motion_between) - 1))
+        seams = []
+        for seam_left, seam_right in seam_chains:
+            joints = _seam_required_times(profiles, seam_left, seam_right)
+            dwell_required = max((item["required_dwell_time"] for item in joints), default=0.0)
+            no_wait_ok = all(item["no_wait_transition_ok"] for item in joints)
+            seams.append({
+                "between_segments": [seam_left, seam_right],
+                "between_segment_ids": [profiles[seam_left]["segment_id"], profiles[seam_right]["segment_id"]],
+                "between_names": [profiles[seam_left]["name"], profiles[seam_right]["name"]],
+                "required_dwell_time": dwell_required,
+                "no_wait_transition_ok": no_wait_ok,
+                "joints": joints,
+            })
+        gaps.append({
+            "left_segment": left_index,
+            "right_segment": right_index,
+            "inside_segments": motion_between,
+            "seams": seams,
+            "existing_wait": existing_wait,
+            "wait_sources": wait_sources,
+        })
+    return gaps
+
+
+def plan_wait_allocation(task: dict, request: dict | None = None) -> dict:
+    segments = task.get("segments", [])
+    if len(segments) < 2:
+        raise ValueError("a chained task requires at least two segments")
+    request = request or {}
+    max_total_duration = request.get("max_total_duration")
+    if max_total_duration is not None and float(max_total_duration) < 0:
+        raise ValueError("max_total_duration must be non-negative")
+    allowed_seams = {tuple(map(int, pair)) for pair in request.get("allowed_seams", [])}
+    immovable_segments = {int(value) for value in request.get("immovable_segments", [])}
+    for index in immovable_segments:
+        if not 0 <= index < len(segments):
+            raise ValueError(f"immovable_segments index {index} is out of range")
+
+    profiles = _motion_segments(segments)
+    gaps = _wait_gaps(segments, profiles)
+    base_duration = sum(profile["duration"] for profile in profiles.values())
+    base_total_wait = sum(
+        sum(float(segments[index].get(field) or 0.0) for field in ("wait_before", "wait_after", "wait"))
+        for index in range(len(segments))
+    )
+
+    total_added = 0.0
+    new_pauses = 0
+    infeasible = []
+    for gap in gaps:
+        if gap["existing_wait"] > EPS:
+            required_pool = max((seam["required_dwell_time"] for seam in gap["seams"]), default=0.0)
+        else:
+            required_pool = max(
+                (0.0 if seam["no_wait_transition_ok"] else seam["required_dwell_time"] for seam in gap["seams"]),
+                default=0.0,
+            )
+        gap["required_wait"] = required_pool
+        shortage = max(0.0, required_pool - gap["existing_wait"])
+        gap["shortage"] = shortage
+        seam_keys = {tuple(pair) for seam in gap["seams"] for pair in (seam["between_segments"],)}
+        gap["seam_keys"] = sorted(seam_keys)
+        gap["allowed"] = all(key in allowed_seams for key in gap["seam_keys"])
+        shifted = [index for index in gap["inside_segments"] if index in immovable_segments]
+        gap["immovable_blocked"] = bool(shifted)
+        gap["blocked_segments"] = shifted
+        if shortage > EPS:
+            reasons = []
+            if not gap["allowed"]:
+                forbidden = [list(key) for key in gap["seam_keys"] if key not in allowed_seams]
+                reasons.append("no_stopping_seam")
+                for key in forbidden:
+                    seam_info = next(item for item in gap["seams"] if item["between_segments"] == list(key))
+                    infeasible.append({
+                        "seam": list(key),
+                        "between_segment_ids": seam_info["between_segment_ids"],
+                        "between_names": seam_info["between_names"],
+                        "shortage_time": shortage,
+                        "existing_wait": gap["existing_wait"],
+                        "required_wait": required_pool,
+                        "reason": "dwell is forbidden at this seam",
+                    })
+            if gap["immovable_blocked"]:
+                reasons.append("immovable_action")
+                infeasible.append({
+                    "seam": [gap["left_segment"], gap["right_segment"]],
+                    "between_segment_ids": [
+                        profiles[gap["left_segment"]]["segment_id"],
+                        profiles[gap["right_segment"]]["segment_id"],
+                    ],
+                    "between_names": [
+                        profiles[gap["left_segment"]]["name"],
+                        profiles[gap["right_segment"]]["name"],
+                    ],
+                    "shortage_time": shortage,
+                    "existing_wait": gap["existing_wait"],
+                    "required_wait": required_pool,
+                    "blocked_segments": shifted,
+                    "reason": "an immovable action would be delayed by the added dwell",
+                })
+            if reasons:
+                gap["added_wait"] = 0.0
+                continue
+        added = shortage
+        gap["added_wait"] = added
+        if added > EPS:
+            total_added += added
+            if gap["existing_wait"] <= EPS:
+                new_pauses += 1
+
+    total_duration = base_duration + base_total_wait + total_added
+    cap_shortage = None
+    if max_total_duration is not None and total_duration > float(max_total_duration) + EPS and not infeasible:
+        cap_shortage = max(0.0, total_duration - float(max_total_duration))
+        infeasible.append({
+            "seam": None,
+            "reason": "task completion cap exceeded",
+            "required_duration": total_duration,
+            "max_total_duration": float(max_total_duration),
+            "shortage_time": cap_shortage,
+        })
+
+    def solution_payload(label: str) -> dict:
+        return {
+            "label": label,
+            "total_added_wait": total_added,
+            "new_pause_count": new_pauses,
+            "planned_duration": total_duration,
+            "allocations": [
+                {
+                    "between_segments": [gap["left_segment"], gap["right_segment"]],
+                    "existing_wait": gap["existing_wait"],
+                    "required_wait": gap["required_wait"],
+                    "added_wait": gap["added_wait"],
+                    "allowed": gap["allowed"],
+                    "immovable_blocked": gap["immovable_blocked"],
+                    "seams": [
+                        {key: seam[key] for key in ("between_segments", "between_segment_ids", "between_names", "required_dwell_time", "no_wait_transition_ok", "joints")}
+                        for seam in gap["seams"]
+                    ],
+                }
+                for gap in gaps
+            ],
+        }
+
+    result = {
+        "feasible": not infeasible,
+        "base_duration": base_duration + base_total_wait,
+        "motion_duration": base_duration,
+        "existing_total_wait": base_total_wait,
+        "max_total_duration": None if max_total_duration is None else float(max_total_duration),
+        "shortest_completion": solution_payload("shortest_completion"),
+        "fewest_new_pauses": solution_payload("fewest_new_pauses"),
+        "comparison": {
+            "equivalent": True,
+            "reason": (
+                "every dwell gap has a single required pool shared by its seams; filling the exact "
+                "shortage simultaneously minimizes completion time and the number of new pauses"
+            ),
+            "shortest_completion_duration": total_duration,
+            "fewest_new_pauses_duration": total_duration,
+            "new_pause_count": new_pauses,
+        },
+        "infeasible": infeasible,
+    }
+
+    if not result["feasible"]:
+        result["revision"] = None
+        result["revision_validation"] = None
+        return result
+
+    if bool(request.get("approve")):
+        revised = copy.deepcopy(segments)
+        for gap in gaps:
+            added = gap["added_wait"]
+            if added <= EPS:
+                continue
+            if gap["wait_sources"]:
+                source_index, field = gap["wait_sources"][0]
+                revised[source_index][field] = float(revised[source_index].get(field) or 0.0) + added
+            else:
+                left_index = gap["left_segment"]
+                revised[left_index]["wait_after"] = (
+                    float(revised[left_index].get("wait_after") or 0.0) + added
+                )
+        revised_task = {**task, "segments": revised}
+        validation = validate_task(revised_task)
+        result["revision"] = revised_task
+        result["revision_validation"] = validation
+    else:
+        result["revision"] = None
+        result["revision_validation"] = None
+    return result

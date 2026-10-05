@@ -1,9 +1,11 @@
+import copy
+
 import pytest
 
 from robot_platform import main
 from robot_platform.robotics import validate_motion
-from robot_platform.schemas import TaskDefinition, TaskValidationRequest
-from robot_platform.taskchain import validate_task
+from robot_platform.schemas import TaskDefinition, TaskValidationRequest, WaitAllocationRequest
+from robot_platform.taskchain import plan_wait_allocation, validate_task
 
 
 BASE = {
@@ -636,3 +638,143 @@ def test_changing_wait_marks_segment_stale_and_reload_revalidates(tmp_path, monk
 
     unchanged = main.run_task_validation(TaskDefinition.model_validate(_two_motion_task(wait=0.71)), previous=sources)
     assert unchanged["stale_segments"] == []
+
+
+def test_wait_plan_derives_brake_and_reverse_acceleration_time():
+    result = plan_wait_allocation(_two_motion_task(), {
+        "allowed_seams": [[0, 1]],
+        "max_total_duration": 2.5,
+    })
+
+    assert result["feasible"] is True
+    assert result["base_duration"] == pytest.approx(1.4)
+    allocation = result["shortest_completion"]["allocations"][0]
+    assert allocation["between_segments"] == [0, 1]
+    assert allocation["required_wait"] == pytest.approx(0.6)
+    assert allocation["existing_wait"] == 0.0
+    assert allocation["added_wait"] == pytest.approx(0.6)
+    joint = allocation["seams"][0]["joints"][0]
+    assert joint["brake_time"] == pytest.approx(0.6)
+    assert joint["restart_time"] == pytest.approx(0.0)
+    joint2 = allocation["seams"][0]["joints"][1]
+    assert joint2["brake_time"] == pytest.approx(0.0)
+    assert joint2["restart_time"] == pytest.approx(0.6)
+    assert result["shortest_completion"]["planned_duration"] == pytest.approx(2.0)
+    assert result["shortest_completion"]["new_pause_count"] == 1
+    assert result["comparison"]["equivalent"] is True
+
+
+def test_wait_plan_extends_existing_dwell_without_new_pause():
+    result = plan_wait_allocation(_two_motion_task(wait=0.51), {
+        "allowed_seams": [[0, 1]],
+    })
+
+    assert result["feasible"] is True
+    shortest = result["shortest_completion"]
+    assert shortest["total_added_wait"] == pytest.approx(0.09)
+    assert shortest["new_pause_count"] == 0
+    assert shortest["planned_duration"] == pytest.approx(2.0)
+
+
+def test_wait_plan_split_pieces_share_one_pool_and_zero_length_adds_nothing():
+    task = _two_motion_task(wait=0.36)
+    task["segments"].insert(1, {
+        "segment_id": "zero",
+        "name": "zero-length",
+        "operation": _single_axis_operation([[0.42, 0, 0], [0.42, 0, 0]], [1, 1, 1]),
+        "wait_after": 0.0,
+    })
+    result = plan_wait_allocation(task, {"allowed_seams": [[0, 1], [1, 2]]})
+
+    assert result["feasible"] is True
+    allocation = result["shortest_completion"]["allocations"][0]
+    assert allocation["seams"] and len(allocation["seams"]) == 2
+    assert allocation["existing_wait"] == pytest.approx(0.36)
+    assert allocation["required_wait"] == pytest.approx(0.6)
+    assert allocation["added_wait"] == pytest.approx(0.24)
+    assert result["shortest_completion"]["new_pause_count"] == 0
+
+
+def test_wait_plan_forbidden_seam_is_named_with_shortage_time():
+    result = plan_wait_allocation(_two_motion_task(), {"allowed_seams": []})
+
+    assert result["feasible"] is False
+    issue = result["infeasible"][0]
+    assert issue["seam"] == [0, 1]
+    assert issue["between_segment_ids"] == ["move-a", "move-b"]
+    assert issue["shortage_time"] == pytest.approx(0.6)
+    assert issue["existing_wait"] == 0.0
+    assert issue["required_wait"] == pytest.approx(0.6)
+    assert "forbidden" in issue["reason"]
+    assert result["revision"] is None
+
+
+def test_wait_plan_immovable_action_blocks_filling_its_gap():
+    result = plan_wait_allocation(_two_motion_task(), {
+        "allowed_seams": [[0, 1]],
+        "immovable_segments": [1],
+    })
+
+    assert result["feasible"] is False
+    issue = next(item for item in result["infeasible"] if item["reason"].startswith("an immovable"))
+    assert issue["seam"] == [0, 1]
+    assert issue["blocked_segments"] == [1]
+    assert issue["shortage_time"] == pytest.approx(0.6)
+
+
+def test_wait_plan_completion_cap_reports_remaining_shortage():
+    result = plan_wait_allocation(_two_motion_task(), {
+        "allowed_seams": [[0, 1]],
+        "max_total_duration": 1.8,
+    })
+
+    assert result["feasible"] is False
+    cap_issue = next(item for item in result["infeasible"] if item["seam"] is None)
+    assert cap_issue["required_duration"] == pytest.approx(2.0)
+    assert cap_issue["max_total_duration"] == 1.8
+    assert cap_issue["shortage_time"] == pytest.approx(0.2)
+
+
+def test_wait_plan_approval_keeps_original_and_revision_validates_under_same_constraints():
+    original = _two_motion_task()
+    result = plan_wait_allocation(copy.deepcopy(original), {
+        "allowed_seams": [[0, 1]],
+        "approve": True,
+    })
+
+    assert result["feasible"] is True
+    revision = result["revision"]
+    assert original["segments"][0].get("wait_after") is None
+    assert revision["segments"][0]["wait_after"] == pytest.approx(0.6)
+    validation = result["revision_validation"]
+    assert validation["valid"] is True
+    assert validation["duration"] == pytest.approx(2.0)
+    seam = validation["seam_checks"][0]
+    assert seam["status"] == "proven"
+    assert seam["wait_time"] == pytest.approx(0.6)
+    assert all(item["ok"] for item in seam["joints"])
+
+
+def test_wait_plan_approval_extends_existing_wait_segment():
+    task = _two_motion_task(wait=0.51)
+    result = plan_wait_allocation(task, {"allowed_seams": [[0, 1]], "approve": True})
+
+    revision = result["revision"]
+    assert revision["segments"][0]["wait_after"] == pytest.approx(0.6)
+    assert len(revision["segments"]) == 2
+    assert result["revision_validation"]["valid"] is True
+
+
+def test_wait_plan_api_endpoint_returns_plan_and_approved_revision(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "task_store", main.TaskStore(tmp_path))
+    request = WaitAllocationRequest.model_validate({
+        "task": _two_motion_task(),
+        "allowed_seams": [[0, 1]],
+        "max_total_duration": 2.0,
+        "approve": True,
+    })
+
+    response = main.plan_task_waits(request)
+    assert response["feasible"] is True
+    assert response["revision_validation"]["valid"] is True
+    assert response["max_total_duration"] == 2.0
